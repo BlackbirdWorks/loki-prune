@@ -1,0 +1,53 @@
+version: '3'
+
+tasks:
+  default:
+    desc: Run all default tasks (lint, vulncheck, test)
+    deps: [lint, vulncheck, test]
+
+  test:
+    desc: Run Go tests with race detector
+    cmd: go test -v -race -coverprofile=coverage.out ./...
+
+  lint:
+    desc: Run golangci-lint
+    cmd: golangci-lint run ./...
+
+  lint-fix:
+    desc: Run golangci-lint with --fix (applies modernize and formatting)
+    cmd: golangci-lint run --fix ./...
+
+  vulncheck:
+    desc: Run govulncheck
+    cmd: govulncheck ./...
+
+  build:
+    desc: Build local binary
+    cmd: >-
+      go build -trimpath -ldflags "-w -s
+      -X github.com/blackbirdworks/loki-prune/pkg/version.BuildVersion=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+      -X github.com/blackbirdworks/loki-prune/pkg/version.Commit=$(git rev-parse --short HEAD 2>/dev/null || echo none)
+      -X github.com/blackbirdworks/loki-prune/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+      -o bin/loki-prune .
+
+  build-linux:
+    desc: Build static Linux amd64 binary
+    cmd: >-
+      CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build
+      -tags 'netgo osusergo static_build'
+      -trimpath
+      -ldflags "-w -s
+      -X github.com/blackbirdworks/loki-prune/pkg/version.BuildVersion=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
+      -X github.com/blackbirdworks/loki-prune/pkg/version.Commit=$(git rev-parse --short HEAD 2>/dev/null || echo none)
+      -X github.com/blackbirdworks/loki-prune/pkg/version.BuildDate=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+      -extldflags '-static'"
+      -o bin/loki-prune-linux-amd64 .
+
+  clean:
+    desc: Clean build artifacts and coverage files
+    cmd: rm -rf bin/ dist/ coverage*.out coverage.txt
+
+  run-once:
+    desc: Build and run once in dry-run mode with config.example.yaml
+    deps: [build]
+    cmd: ./bin/loki-prune --config config.example.yaml --once --dry-run
