@@ -123,5 +123,5 @@ release:
 
     ### From source
     ```bash
-    go install github.com/blackbirdworks/loki-prune/cmd/loki-prune@{{ .Tag }}
+    go install github.com/blackbirdworks/loki-prune@{{ .Tag }}
     ```
