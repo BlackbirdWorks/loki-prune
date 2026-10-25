@@ -1,4 +1,5 @@
-package main
+// Package cli provides the command-line interface, argument parsing, and daemon orchestration for loki-prune.
+package cli
 
 import (
 	"context"
@@ -35,14 +36,14 @@ type CLI struct {
 	Version kong.VersionFlag `                          help:"Print version and exit."           short:"v"`
 }
 
-// RunCLI initializes Kong, parses arguments, and executes the CLI application.
-func RunCLI(args []string, out, errOut io.Writer) error {
-	var cli CLI
+// Run initializes Kong, parses arguments, and executes the CLI application.
+func Run(args []string, out, errOut io.Writer) error {
+	var c CLI
 	var exited bool
 	var exitCode int
 
 	parser, err := kong.New(
-		&cli,
+		&c,
 		kong.Name("loki-prune"),
 		kong.Description("Automated storage-quota rotator and compression engine for Grafana Loki"),
 		kong.Configuration(kongyaml.Loader),
@@ -75,7 +76,12 @@ func RunCLI(args []string, out, errOut io.Writer) error {
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return cli.execute(sigCtx, kctx, out)
+	return c.execute(sigCtx, kctx, out)
+}
+
+// RunCLI is an alias for Run for backwards compatibility.
+func RunCLI(args []string, out, errOut io.Writer) error {
+	return Run(args, out, errOut)
 }
 
 func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error {
@@ -122,10 +128,11 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 		return nil
 	}
 
-	return c.runDaemon(ctx, cfg.Daemon.Interval, runCycle)
+	return c.RunDaemon(ctx, cfg.Daemon.Interval, runCycle)
 }
 
-func (c *CLI) runDaemon(ctx context.Context, interval time.Duration, runCycle func()) error {
+// RunDaemon runs a continuous ticker loop executing the provided cycle function until the context is canceled.
+func (c *CLI) RunDaemon(ctx context.Context, interval time.Duration, runCycle func()) error {
 	appLog := logger.FromContext(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

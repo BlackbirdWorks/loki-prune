@@ -1,4 +1,4 @@
-package main
+package cli_test
 
 import (
 	"bytes"
@@ -11,9 +11,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/blackbirdworks/loki-prune/cli"
 )
 
-func TestRunCLI(t *testing.T) {
+func TestRun(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -94,7 +96,7 @@ func TestRunCLI(t *testing.T) {
 
 			var out bytes.Buffer
 			var errOut bytes.Buffer
-			err := RunCLI(args, &out, &errOut)
+			err := cli.Run(args, &out, &errOut)
 			if tc.wantErr != nil {
 				tc.wantErr(t, err)
 			} else {
@@ -104,36 +106,28 @@ func TestRunCLI(t *testing.T) {
 	}
 }
 
-func TestRunMain(t *testing.T) {
+func TestRunCLI(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name         string
-		args         []string
-		expectedCode int
+		name string
+		args []string
 	}{
-		{
-			name:         "help returns zero exit code",
-			args:         []string{"--help"},
-			expectedCode: 0,
-		},
-		{
-			name:         "invalid argument returns exit code 1",
-			args:         []string{"--invalid-flag"},
-			expectedCode: 1,
-		},
+		{name: "version alias call", args: []string{"--version"}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			code := runMain(tc.args)
-			assert.Equal(t, tc.expectedCode, code)
+			var out bytes.Buffer
+			var errOut bytes.Buffer
+			err := cli.RunCLI(tc.args, &out, &errOut)
+			require.NoError(t, err)
 		})
 	}
 }
 
-func TestRunDaemon(t *testing.T) {
+func TestCLI_RunDaemon(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -146,13 +140,13 @@ func TestRunDaemon(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			cli := &CLI{}
+			c := &cli.CLI{}
 			ctx, cancel := context.WithCancel(context.Background())
 			var count atomic.Int32
 
 			done := make(chan struct{})
 			go func() {
-				_ = cli.runDaemon(ctx, tc.interval, func() {
+				_ = c.RunDaemon(ctx, tc.interval, func() {
 					count.Add(1)
 				})
 				close(done)

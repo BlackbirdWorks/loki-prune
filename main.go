@@ -4,6 +4,8 @@ package main
 
 import (
 	"os"
+
+	"github.com/blackbirdworks/loki-prune/cli"
 )
 
 func main() {
@@ -13,7 +15,7 @@ func main() {
 }
 
 func runMain(args []string) int {
-	if err := RunCLI(args, os.Stdout, os.Stderr); err != nil {
+	if err := cli.Run(args, os.Stdout, os.Stderr); err != nil {
 		return 1
 	}
 
