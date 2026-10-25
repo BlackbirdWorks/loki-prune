@@ -12,14 +12,14 @@ build:
 	go build \
 		-trimpath \
 		-ldflags "$(LDFLAGS)" \
-		-o bin/$(BINARY_NAME) ./cmd/loki-prune
+		-o bin/$(BINARY_NAME) .
 
 build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 		-tags 'netgo osusergo static_build' \
 		-trimpath \
 		-ldflags "$(LDFLAGS) -extldflags '-static'" \
-		-o bin/$(BINARY_NAME)-linux-amd64 ./cmd/loki-prune
+		-o bin/$(BINARY_NAME)-linux-amd64 .
 
 test:
 	go test -v -race ./...

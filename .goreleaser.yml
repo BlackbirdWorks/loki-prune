@@ -10,7 +10,7 @@ before:
 
 builds:
   - id: loki-prune
-    main: ./cmd/loki-prune
+    main: .
     binary: loki-prune
     env:
       - CGO_ENABLED=0

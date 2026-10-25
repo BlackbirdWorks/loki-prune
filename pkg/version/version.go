@@ -1,5 +1,7 @@
+// Package version provides build information for loki-prune.
 package version
 
+//nolint:gochecknoglobals // These variables are populated by ldflags during build.
 var (
 	// BuildVersion is set by ldflags at build time.
 	BuildVersion = "dev"

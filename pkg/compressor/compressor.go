@@ -1,8 +1,10 @@
+// Package compressor provides streaming tar archive creation with zstd and gzip support.
 package compressor
 
 import (
 	"archive/tar"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,13 +14,26 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
+// ErrUnsupportedCompression is returned when an invalid compression type is passed.
+var ErrUnsupportedCompression = errors.New("unsupported compression type")
+
 // CompressionType represents supported compression algorithms.
 type CompressionType string
 
 const (
+	// TypeZstd represents Zstandard compression.
 	TypeZstd CompressionType = "zstd"
+	// TypeGzip represents Gzip compression.
 	TypeGzip CompressionType = "gzip"
+	// TypeNone represents uncompressed tar archives.
 	TypeNone CompressionType = "none"
+
+	dirPerm  = 0750
+	filePerm = 0600
+
+	zstdLevelFastest = 1
+	zstdLevelDefault = 4
+	zstdLevelBetter  = 9
 )
 
 // Compressor compresses files and directories into tar archives.
@@ -38,7 +53,7 @@ func New(cType string, level int) (*Compressor, error) {
 	case "none":
 		return &Compressor{compType: TypeNone, level: 0}, nil
 	default:
-		return nil, fmt.Errorf("unsupported compression type: %s", cType)
+		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, cType)
 	}
 }
 
@@ -58,115 +73,136 @@ func (c *Compressor) Extension() string {
 
 // CompressDirectory archives sourceDir into targetArchive.
 func (c *Compressor) CompressDirectory(sourceDir, targetArchive string) error {
-	if err := os.MkdirAll(filepath.Dir(targetArchive), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(targetArchive), dirPerm); err != nil {
 		return fmt.Errorf("creating target parent directory: %w", err)
 	}
 
 	tempArchive := targetArchive + ".tmp"
-	outFile, err := os.Create(tempArchive)
-	if err != nil {
-		return fmt.Errorf("creating temporary archive file: %w", err)
+	outFile, openErr := os.OpenFile(tempArchive, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
+	if openErr != nil {
+		return fmt.Errorf("creating temporary archive file: %w", openErr)
 	}
 	defer func() {
-		outFile.Close()
-		os.Remove(tempArchive) // no-op if renamed
+		_ = outFile.Close()
+		_ = os.Remove(tempArchive)
 	}()
 
-	var compWriter io.WriteCloser
+	compWriter, compErr := c.createCompWriter(outFile)
+	if compErr != nil {
+		return compErr
+	}
+
+	tarWriter := tar.NewWriter(compWriter)
+	if walkErr := c.archiveWalk(sourceDir, tarWriter); walkErr != nil {
+		return walkErr
+	}
+
+	if tarCloseErr := tarWriter.Close(); tarCloseErr != nil {
+		return fmt.Errorf("closing tar writer: %w", tarCloseErr)
+	}
+	if compCloseErr := compWriter.Close(); compCloseErr != nil {
+		return fmt.Errorf("closing compression writer: %w", compCloseErr)
+	}
+	if syncErr := outFile.Sync(); syncErr != nil {
+		return fmt.Errorf("syncing archive file: %w", syncErr)
+	}
+	if closeErr := outFile.Close(); closeErr != nil {
+		return fmt.Errorf("closing file: %w", closeErr)
+	}
+
+	if renameErr := os.Rename(tempArchive, targetArchive); renameErr != nil {
+		return fmt.Errorf("moving temporary archive to final location: %w", renameErr)
+	}
+
+	return nil
+}
+
+func (c *Compressor) createCompWriter(w io.Writer) (io.WriteCloser, error) {
 	switch c.compType {
 	case TypeZstd:
 		zLevel := zstd.SpeedDefault
 		if c.level > 0 {
 			switch {
-			case c.level <= 1:
+			case c.level <= zstdLevelFastest:
 				zLevel = zstd.SpeedFastest
-			case c.level <= 4:
+			case c.level <= zstdLevelDefault:
 				zLevel = zstd.SpeedDefault
-			case c.level <= 9:
+			case c.level <= zstdLevelBetter:
 				zLevel = zstd.SpeedBetterCompression
 			default:
 				zLevel = zstd.SpeedBestCompression
 			}
 		}
-		zEnc, err := zstd.NewWriter(outFile, zstd.WithEncoderLevel(zLevel))
-		if err != nil {
-			return fmt.Errorf("initializing zstd writer: %w", err)
+
+		zEnc, zErr := zstd.NewWriter(w, zstd.WithEncoderLevel(zLevel))
+		if zErr != nil {
+			return nil, fmt.Errorf("initializing zstd writer: %w", zErr)
 		}
-		compWriter = zEnc
+
+		return zEnc, nil
+
 	case TypeGzip:
 		gzLevel := gzip.DefaultCompression
 		if c.level >= 1 && c.level <= 9 {
 			gzLevel = c.level
 		}
-		gzWriter, err := gzip.NewWriterLevel(outFile, gzLevel)
-		if err != nil {
-			return fmt.Errorf("initializing gzip writer: %w", err)
+		gzWriter, gzErr := gzip.NewWriterLevel(w, gzLevel)
+		if gzErr != nil {
+			return nil, fmt.Errorf("initializing gzip writer: %w", gzErr)
 		}
-		compWriter = gzWriter
+
+		return gzWriter, nil
+
 	case TypeNone:
-		compWriter = NopWriteCloser(outFile)
+		return NopWriteCloser(w), nil
+
+	default:
+		return nil, ErrUnsupportedCompression
 	}
+}
 
-	tarWriter := tar.NewWriter(compWriter)
-
-	// Walk sourceDir and write to tarWriter
-	err = filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
+	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
 
-		relPath, err := filepath.Rel(sourceDir, path)
-		if err != nil {
-			return fmt.Errorf("rel path calculation: %w", err)
+		relPath, relErr := filepath.Rel(sourceDir, path)
+		if relErr != nil {
+			return fmt.Errorf("rel path calculation: %w", relErr)
 		}
 
 		if relPath == "." {
 			return nil
 		}
 
-		header, err := tar.FileInfoHeader(info, info.Name())
-		if err != nil {
-			return fmt.Errorf("creating tar header for %s: %w", path, err)
+		header, headErr := tar.FileInfoHeader(info, info.Name())
+		if headErr != nil {
+			return fmt.Errorf("creating tar header for %s: %w", path, headErr)
 		}
 		header.Name = filepath.ToSlash(relPath)
 
-		if err := tarWriter.WriteHeader(header); err != nil {
-			return fmt.Errorf("writing tar header for %s: %w", path, err)
+		if writeErr := tw.WriteHeader(header); writeErr != nil {
+			return fmt.Errorf("writing tar header for %s: %w", path, writeErr)
 		}
 
 		if !info.IsDir() {
-			srcFile, err := os.Open(path)
-			if err != nil {
-				return fmt.Errorf("opening file %s: %w", path, err)
-			}
-			defer srcFile.Close()
-
-			if _, err := io.Copy(tarWriter, srcFile); err != nil {
-				return fmt.Errorf("copying file %s into tar: %w", path, err)
-			}
+			return copyFileToTar(path, tw)
 		}
+
 		return nil
 	})
+}
 
-	if err != nil {
-		return fmt.Errorf("tar traversal failed: %w", err)
+func copyFileToTar(path string, tw *tar.Writer) error {
+	srcFile, openErr := os.Open(path)
+	if openErr != nil {
+		return fmt.Errorf("opening file %s: %w", path, openErr)
 	}
+	defer srcFile.Close()
 
-	if err := tarWriter.Close(); err != nil {
-		return fmt.Errorf("closing tar writer: %w", err)
-	}
-	if err := compWriter.Close(); err != nil {
-		return fmt.Errorf("closing compression writer: %w", err)
-	}
-	if err := outFile.Sync(); err != nil {
-		return fmt.Errorf("syncing archive file: %w", err)
-	}
-	if err := outFile.Close(); err != nil {
-		return fmt.Errorf("closing file: %w", err)
-	}
-
-	if err := os.Rename(tempArchive, targetArchive); err != nil {
-		return fmt.Errorf("moving temporary archive to final location: %w", err)
+	if _, copyErr := io.Copy(tw, srcFile); copyErr != nil {
+		return fmt.Errorf("copying file %s into tar: %w", path, copyErr)
 	}
 
 	return nil
@@ -178,6 +214,7 @@ type nopWriteCloser struct {
 
 func (nopWriteCloser) Close() error { return nil }
 
+// NopWriteCloser wraps an io.Writer with a no-op Close method.
 func NopWriteCloser(w io.Writer) io.WriteCloser {
 	return nopWriteCloser{w}
 }

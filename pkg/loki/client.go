@@ -1,7 +1,9 @@
+// Package loki provides a client for interacting with Grafana Loki's HTTP API.
 package loki
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,17 +11,30 @@ import (
 	"time"
 )
 
+var (
+	// ErrLokiFlushFailed indicates the /flush endpoint returned an unexpected status code.
+	ErrLokiFlushFailed = errors.New("loki flush endpoint failed")
+	// ErrLokiReadyFailed indicates the /ready endpoint returned a non-200 status code.
+	ErrLokiReadyFailed = errors.New("loki ready endpoint failed")
+)
+
+const (
+	maxResponseBodyRead = 1024
+	defaultTimeout      = 30 * time.Second
+)
+
 // Client interacts with the Loki HTTP API.
 type Client struct {
-	baseURL    string
 	httpClient *http.Client
+	baseURL    string
 }
 
 // NewClient creates a new Loki API client.
 func NewClient(baseURL string, timeout time.Duration) *Client {
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = defaultTimeout
 	}
+
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
@@ -29,7 +44,7 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 }
 
 // Flush triggers Loki to write all in-memory chunks/streams to disk.
-// Endpoint: POST /flush
+// Endpoint: POST /flush.
 func (c *Client) Flush(ctx context.Context) error {
 	url := fmt.Sprintf("%s/flush", c.baseURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
@@ -44,27 +59,26 @@ func (c *Client) Flush(ctx context.Context) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("loki /flush returned HTTP %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyRead))
+
+		return fmt.Errorf("%w: HTTP %d: %s", ErrLokiFlushFailed, resp.StatusCode, string(body))
 	}
 
 	return nil
 }
 
 // Reload triggers Loki's runtime configuration or service reload.
-// Tries POST /flush first, then /runtime_config/reload if supported.
+// It ensures memory chunks are flushed and requests a runtime reload.
 func (c *Client) Reload(ctx context.Context) error {
-	// First ensure in-memory chunks are flushed so state is synchronized
 	if err := c.Flush(ctx); err != nil {
 		return err
 	}
 
-	// Attempt runtime config reload if endpoint exists (non-fatal if 404)
 	url := fmt.Sprintf("%s/runtime_config/reload", c.baseURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
-	if err == nil {
-		if resp, err := c.httpClient.Do(req); err == nil {
-			resp.Body.Close()
+	req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if reqErr == nil {
+		if resp, doErr := c.httpClient.Do(req); doErr == nil {
+			_ = resp.Body.Close()
 		}
 	}
 

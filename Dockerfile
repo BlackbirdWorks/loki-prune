@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 go build \
     -tags 'netgo osusergo static_build' \
     -trimpath \
     -ldflags="-w -s -extldflags '-static -fno-PIC'" \
-    -o loki-prune ./cmd/loki-prune
+    -o loki-prune .
 
 # Final stage
 FROM scratch
