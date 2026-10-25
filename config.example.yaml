@@ -1,0 +1,42 @@
+# loki-prune configuration example
+
+# Loki API integration settings
+loki:
+  # Base URL of your Loki instance
+  url: "http://127.0.0.1:3100"
+  timeout: "30s"
+
+  # API synchronization hooks (https://github.com/grafana/loki/issues/6876)
+  flush_before_rotate: true   # Calls POST /flush to push memory chunks to disk before rotating
+  reload_after_rotate: true   # Calls POST /flush to ensure storage synchronization post-rotation
+
+# Daemon / scheduling settings
+daemon:
+  interval: "5m"              # Frequency of evaluation cycles
+  log_level: "info"           # debug, info, warn, error
+
+# Monitored directory paths
+paths:
+  - name: "loki-chunks"
+    path: "/share/Data/metrics/loki/chunks"
+    archive_dir: "/share/Data/metrics/loki/archive"
+
+    # Size thresholds (supports B, KB, KiB, MB, MiB, GB, GiB, TB, TiB)
+    trigger_size: "48GB"       # Begin rotation when directory exceeds 48 GB
+    target_size: "40GB"        # Move chunks until directory is reduced to 40 GB
+
+    rotation:
+      # Keep up to X rotated archives; older archives are pruned automatically
+      max_rotations: 10
+
+      # Compression settings
+      compress: true
+      type: "zstd"             # "zstd", "gzip", or "none"
+      level: 3                 # Compression level (1-19 for zstd, 1-9 for gzip)
+
+      # Delayed compression options
+      delay:
+        # Keep the newest N rotation batches uncompressed before compressing them
+        rotations: 2
+        # Or only compress rotations older than this duration (e.g. "24h", "7d")
+        age: "24h"

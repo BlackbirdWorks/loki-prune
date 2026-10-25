@@ -1,0 +1,127 @@
+# GoReleaser configuration for loki-prune
+# Documentation: https://goreleaser.com
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod download
+
+builds:
+  - id: loki-prune
+    main: ./cmd/loki-prune
+    binary: loki-prune
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    tags: [netgo, osusergo, static_build]
+    ldflags:
+      - -s -w
+      - -X github.com/blackbirdworks/loki-prune/pkg/version.BuildVersion={{.Version}}
+      - -X github.com/blackbirdworks/loki-prune/pkg/version.Commit={{.FullCommit}}
+      - -X github.com/blackbirdworks/loki-prune/pkg/version.BuildDate={{.Date}}
+      - -extldflags "-static"
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: loki-prune-archive
+    ids: [loki-prune]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: zip
+    files:
+      - README.md
+      - LICENSE
+      - config.example.yaml
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'merge conflict'
+      - Merge pull request
+      - Merge remote-tracking branch
+      - Merge branch
+  groups:
+    - title: 'New Features'
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: 'Bug Fixes'
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: 'Performance Improvements'
+      regexp: "^.*perf[(\\w)]*:+.*$"
+      order: 2
+    - title: 'Refactors'
+      regexp: "^.*refactor[(\\w)]*:+.*$"
+      order: 3
+    - title: 'Other Changes'
+      order: 999
+
+dockers_v2:
+  - id: loki-prune
+    dockerfile: Dockerfile.goreleaser
+    ids: [loki-prune]
+    images:
+      - "ghcr.io/blackbirdworks/loki-prune"
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .IsSnapshot }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.created: "{{.Date}}"
+      org.opencontainers.image.title: "{{.ProjectName}}"
+      org.opencontainers.image.revision: "{{.FullCommit}}"
+      org.opencontainers.image.version: "{{.Version}}"
+      org.opencontainers.image.source: "{{.GitURL}}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+
+release:
+  github:
+    owner: blackbirdworks
+    name: loki-prune
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## loki-prune {{ .Tag }}
+
+    **Full Changelog**: https://github.com/blackbirdworks/loki-prune/compare/{{ .PreviousTag }}...{{ .Tag }}
+  footer: |
+    ## Docker
+
+    ```bash
+    docker pull ghcr.io/blackbirdworks/loki-prune:{{ .Version }}
+    ```
+
+    ## Installation
+
+    ### Binary
+    Download the appropriate archive for your platform from the release assets below.
+
+    ### From source
+    ```bash
+    go install github.com/blackbirdworks/loki-prune/cmd/loki-prune@{{ .Tag }}
+    ```

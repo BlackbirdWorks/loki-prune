@@ -1,0 +1,20 @@
+# Dockerfile used by GoReleaser for multi-arch builds.
+FROM alpine:3 AS certs
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+
+ARG TARGETPLATFORM
+
+WORKDIR /app
+
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY $TARGETPLATFORM/loki-prune .
+
+LABEL org.opencontainers.image.source="https://github.com/blackbirdworks/loki-prune"
+LABEL org.opencontainers.image.description="Automated storage-quota rotator and compression engine for Grafana Loki"
+
+USER 65532:65532
+
+ENTRYPOINT ["./loki-prune"]
+CMD ["--config", "/etc/loki-prune/config.yaml"]
