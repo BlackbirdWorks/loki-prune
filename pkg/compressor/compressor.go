@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,7 +171,7 @@ func (c *Compressor) createCompWriter(w io.Writer) (io.WriteCloser, error) {
 }
 
 func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
-	return filepath.Walk(sourceDir, func(path string, info os.FileInfo, walkErr error) error {
+	return filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -184,6 +185,11 @@ func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
 			return nil
 		}
 
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return fmt.Errorf("getting file info for %s: %w", path, infoErr)
+		}
+
 		header, headErr := tar.FileInfoHeader(info, info.Name())
 		if headErr != nil {
 			return fmt.Errorf("creating tar header for %s: %w", path, headErr)
@@ -194,7 +200,7 @@ func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
 			return fmt.Errorf("writing tar header for %s: %w", path, writeErr)
 		}
 
-		if !info.IsDir() {
+		if !d.IsDir() {
 			return copyFileToTar(path, tw)
 		}
 

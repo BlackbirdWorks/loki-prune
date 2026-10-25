@@ -174,20 +174,16 @@ func (c *Config) validateDaemon() error {
 		c.Daemon.Interval = d
 	}
 
-	if c.Daemon.LogLevel == "" {
-		if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
-			c.Daemon.LogLevel = envLevel
-		} else {
-			c.Daemon.LogLevel = "info"
-		}
+	if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
+		c.Daemon.LogLevel = envLevel
+	} else if c.Daemon.LogLevel == "" {
+		c.Daemon.LogLevel = "info"
 	}
 
-	if c.Daemon.LogType == "" {
-		if envType := os.Getenv("LOG_TYPE"); envType != "" {
-			c.Daemon.LogType = envType
-		} else {
-			c.Daemon.LogType = "text"
-		}
+	if envType := os.Getenv("LOG_TYPE"); envType != "" {
+		c.Daemon.LogType = envType
+	} else if c.Daemon.LogType == "" {
+		c.Daemon.LogType = "text"
 	}
 
 	return nil

@@ -4,6 +4,7 @@ package rotator
 import (
 	"context"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -172,7 +173,9 @@ func (r *Rotator) moveSingleItem(item fileEntry, targetDir string) error {
 	}
 
 	if renErr := os.Rename(item.path, destPath); renErr != nil {
-		return renErr
+		if copyErr := r.moveFileFallback(item.path, destPath); copyErr != nil {
+			return fmt.Errorf("moving %s to %s: %w", item.path, destPath, copyErr)
+		}
 	}
 
 	if item.path == r.cfg.Path {
@@ -183,6 +186,33 @@ func (r *Rotator) moveSingleItem(item fileEntry, targetDir string) error {
 	}
 
 	return nil
+}
+
+func (r *Rotator) moveFileFallback(src, dst string) error {
+	in, openErr := os.Open(src)
+	if openErr != nil {
+		return fmt.Errorf("opening source file for cross-device copy: %w", openErr)
+	}
+	defer in.Close()
+
+	out, createErr := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
+	if createErr != nil {
+		return fmt.Errorf("creating destination file for cross-device copy: %w", createErr)
+	}
+	defer out.Close()
+
+	if _, copyErr := io.Copy(out, in); copyErr != nil {
+		return fmt.Errorf("copying across devices: %w", copyErr)
+	}
+	if syncErr := out.Sync(); syncErr != nil {
+		return fmt.Errorf("syncing copied file: %w", syncErr)
+	}
+	if closeErr := out.Close(); closeErr != nil {
+		return fmt.Errorf("closing copied file: %w", closeErr)
+	}
+	_ = in.Close()
+
+	return os.Remove(src)
 }
 
 func (r *Rotator) moveBatch(
