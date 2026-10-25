@@ -28,6 +28,7 @@ func TestNew(t *testing.T) {
 		{name: "zstd level 12", cType: "zstd", level: 12, wantErr: nil, expectExt: ".tar.zst"},
 		{name: "gzip standard", cType: "gzip", level: 6, wantErr: nil, expectExt: ".tar.gz"},
 		{name: "gz alias", cType: "gz", level: 1, wantErr: nil, expectExt: ".tar.gz"},
+		{name: "zip standard", cType: "zip", level: 6, wantErr: nil, expectExt: ".zip"},
 		{name: "none uncompressed", cType: "none", level: 0, wantErr: nil, expectExt: ".tar"},
 		{
 			name:      "unsupported format",
@@ -64,6 +65,7 @@ func TestNewWithType(t *testing.T) {
 	}{
 		{name: "zstd", cType: compressor.TypeZstd, level: 3, expectExt: ".tar.zst"},
 		{name: "gzip", cType: compressor.TypeGzip, level: 6, expectExt: ".tar.gz"},
+		{name: "zip", cType: compressor.TypeZip, level: 6, expectExt: ".zip"},
 		{name: "none", cType: compressor.TypeNone, level: 0, expectExt: ".tar"},
 	}
 
@@ -87,6 +89,7 @@ func TestCompressor_Extension(t *testing.T) {
 	}{
 		{name: "zstd", cType: compressor.TypeZstd, expectExt: ".tar.zst"},
 		{name: "gzip", cType: compressor.TypeGzip, expectExt: ".tar.gz"},
+		{name: "zip", cType: compressor.TypeZip, expectExt: ".zip"},
 		{name: "none", cType: compressor.TypeNone, expectExt: ".tar"},
 		{name: "unknown fallback", cType: "unknown", expectExt: ".tar"},
 	}
@@ -240,6 +243,36 @@ func TestCompressor_CompressDirectory(t *testing.T) {
 				require.NoError(t, err)
 
 				return c, src, filepath.Join(tmp, "out.tar")
+			},
+			wantErr: nil,
+		},
+		{
+			name: "zip default level",
+			setup: func(t *testing.T) (*compressor.Compressor, string, string) {
+				t.Helper()
+				tmp := t.TempDir()
+				src := filepath.Join(tmp, "src")
+				require.NoError(t, os.MkdirAll(filepath.Join(src, "sub"), 0750))
+				require.NoError(t, os.WriteFile(filepath.Join(src, "file.txt"), []byte("zip-content"), 0600))
+				c, err := compressor.New("zip", 0)
+				require.NoError(t, err)
+
+				return c, src, filepath.Join(tmp, "out.zip")
+			},
+			wantErr: nil,
+		},
+		{
+			name: "zip level 6 compression",
+			setup: func(t *testing.T) (*compressor.Compressor, string, string) {
+				t.Helper()
+				tmp := t.TempDir()
+				src := filepath.Join(tmp, "src")
+				require.NoError(t, os.MkdirAll(src, 0750))
+				require.NoError(t, os.WriteFile(filepath.Join(src, "file.txt"), []byte("zip-level-6"), 0600))
+				c, err := compressor.New("zip", 6)
+				require.NoError(t, err)
+
+				return c, src, filepath.Join(tmp, "out.zip")
 			},
 			wantErr: nil,
 		},

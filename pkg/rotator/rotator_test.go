@@ -435,3 +435,220 @@ func TestRotator_Process(t *testing.T) {
 		})
 	}
 }
+
+func TestRotator_ProcessWithRatio(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		setup      func(t *testing.T) (*rotator.Rotator, func(t *testing.T))
+		wantErr    func(t *testing.T, err error)
+		checkRatio func(t *testing.T, ratio float64)
+		name       string
+	}{
+		{
+			name: "returns correct quota ratio when below trigger",
+			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
+				t.Helper()
+				tmp := t.TempDir()
+				watchDir := filepath.Join(tmp, "chunks")
+				archiveDir := filepath.Join(tmp, "archive")
+				require.NoError(t, os.MkdirAll(watchDir, 0750))
+				require.NoError(t, os.MkdirAll(archiveDir, 0750))
+				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "chunk.bin"), make([]byte, 500), 0600))
+
+				pCfg := config.PathConfig{
+					Name:             "ratio-test",
+					Path:             watchDir,
+					ArchiveDir:       archiveDir,
+					TriggerSizeBytes: 1000,
+					TargetSizeBytes:  800,
+					DiskGuardPercent: 99.9,
+				}
+				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+				require.NoError(t, err)
+
+				return r, func(_ *testing.T) {}
+			},
+			checkRatio: func(t *testing.T, ratio float64) {
+				t.Helper()
+				assert.InDelta(t, 0.5, ratio, 0.5)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "single file fast path computes ratio and rotates when above trigger",
+			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
+				t.Helper()
+				tmp := t.TempDir()
+				logFile := filepath.Join(tmp, "app.log")
+				archiveDir := filepath.Join(tmp, "archive")
+				require.NoError(t, os.WriteFile(logFile, make([]byte, 2000), 0600))
+
+				pCfg := config.PathConfig{
+					Name:             "single-file",
+					Path:             logFile,
+					ArchiveDir:       archiveDir,
+					TriggerSizeBytes: 1000,
+					TargetSizeBytes:  500,
+					DiskGuardPercent: 99.9,
+				}
+				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+				require.NoError(t, err)
+
+				return r, func(t *testing.T) {
+					t.Helper()
+					st, statErr := os.Stat(logFile)
+					require.NoError(t, statErr)
+					assert.Equal(t, int64(0), st.Size())
+				}
+			},
+			checkRatio: func(t *testing.T, ratio float64) {
+				t.Helper()
+				assert.GreaterOrEqual(t, ratio, 2.0)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "disk guard threshold at 0 triggers emergency rotation",
+			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
+				t.Helper()
+				tmp := t.TempDir()
+				watchDir := filepath.Join(tmp, "chunks")
+				archiveDir := filepath.Join(tmp, "archive")
+				require.NoError(t, os.MkdirAll(watchDir, 0750))
+				require.NoError(t, os.MkdirAll(archiveDir, 0750))
+				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "chunk.bin"), make([]byte, 500), 0600))
+
+				pCfg := config.PathConfig{
+					Name:             "guard-test",
+					Path:             watchDir,
+					ArchiveDir:       archiveDir,
+					TriggerSizeBytes: 10000,
+					TargetSizeBytes:  5000,
+					DiskGuardPercent: 0.001,
+				}
+				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+				require.NoError(t, err)
+
+				return r, func(t *testing.T) {
+					t.Helper()
+					entries, readErr := os.ReadDir(archiveDir)
+					require.NoError(t, readErr)
+					assert.NotEmpty(t, entries)
+				}
+			},
+			checkRatio: func(t *testing.T, ratio float64) {
+				t.Helper()
+				assert.Greater(t, ratio, 0.0)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "missing path returns zero ratio and nil error",
+			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
+				t.Helper()
+				pCfg := config.PathConfig{
+					Name:             "missing-path",
+					Path:             "/non/existent/path/for/test",
+					TriggerSizeBytes: 1000,
+				}
+				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+				require.NoError(t, err)
+
+				return r, func(_ *testing.T) {}
+			},
+			checkRatio: func(t *testing.T, ratio float64) {
+				t.Helper()
+				assert.InDelta(t, 0.0, ratio, 0.001)
+			},
+			wantErr: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, verify := tc.setup(t)
+			ratio, err := r.ProcessWithRatio(context.Background())
+			if tc.wantErr != nil {
+				tc.wantErr(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.checkRatio != nil {
+				tc.checkRatio(t, ratio)
+			}
+			verify(t)
+		})
+	}
+}
+
+func TestRotator_Tracker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+	}{
+		{name: "tracker returns non-nil on valid rotator"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmp := t.TempDir()
+			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
+			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+			require.NoError(t, err)
+			defer r.Close()
+
+			assert.NotNil(t, r.Tracker())
+		})
+	}
+}
+
+func TestRotator_StartTracker(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+	}{
+		{name: "start tracker can be canceled cleanly"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmp := t.TempDir()
+			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
+			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+			require.NoError(t, err)
+			defer r.Close()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			r.StartTracker(ctx)
+			cancel()
+		})
+	}
+}
+
+func TestRotator_Close(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+	}{
+		{name: "close succeeds on valid rotator"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmp := t.TempDir()
+			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
+			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
+			require.NoError(t, err)
+
+			assert.NoError(t, r.Close())
+		})
+	}
+}

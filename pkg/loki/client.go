@@ -21,6 +21,9 @@ var (
 const (
 	maxResponseBodyRead = 1024
 	defaultTimeout      = 30 * time.Second
+	defaultMaxIdleConns = 100
+	defaultIdlePerHost  = 10
+	defaultIdleConnWait = 90 * time.Second
 )
 
 // Client interacts with the Loki HTTP API.
@@ -35,10 +38,17 @@ func NewClient(baseURL string, timeout time.Duration) *Client {
 		timeout = defaultTimeout
 	}
 
+	transport := &http.Transport{
+		MaxIdleConns:        defaultMaxIdleConns,
+		MaxIdleConnsPerHost: defaultIdlePerHost,
+		IdleConnTimeout:     defaultIdleConnWait,
+	}
+
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
-			Timeout: timeout,
+			Timeout:   timeout,
+			Transport: transport,
 		},
 	}
 }

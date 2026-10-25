@@ -163,6 +163,32 @@ paths:
 				assert.Equal(t, filepath.Join("/tmp/chunks", "archive"), p.ArchiveDir)
 				assert.Equal(t, "zstd", p.Rotation.Type)
 				assert.Equal(t, int64(float64(p.TriggerSizeBytes)*0.8), p.TargetSizeBytes)
+				assert.True(t, cfg.Daemon.Adaptive)
+				assert.Equal(t, 5*time.Second, cfg.Daemon.MinInterval)
+				assert.InDelta(t, 90.0, p.DiskGuardPercent, 0.001)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "valid zip rotation type",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := `
+paths:
+  - path: "/tmp/chunks"
+    trigger_size: "10GB"
+    rotation:
+      type: "zip"
+`
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: func(t *testing.T, cfg *config.Config) {
+				t.Helper()
+				require.Len(t, cfg.Paths, 1)
+				assert.Equal(t, "zip", cfg.Paths[0].Rotation.Type)
 			},
 			wantErr: nil,
 		},
@@ -331,6 +357,23 @@ paths:
 				t.Helper()
 				tmp := filepath.Join(t.TempDir(), "config.yaml")
 				content := "daemon:\n  interval: 'invalid'\npaths:\n  - path: '/tmp/chunks'\n    trigger_size: '10GB'\n"
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: nil,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.ErrorIs(t, err, config.ErrInvalidDuration)
+			},
+		},
+		{
+			name: "invalid daemon min_interval error",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := "daemon:\n  min_interval: 'invalid'\npaths:\n  - path: '/tmp/chunks'\n    trigger_size: '10GB'\n"
 				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
 
 				return tmp

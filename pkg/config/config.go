@@ -34,10 +34,12 @@ var (
 )
 
 const (
-	defaultTargetRatio  = 0.8
-	defaultLokiTimeout  = 30 * time.Second
-	defaultInterval     = 5 * time.Minute
-	regexExpectedGroups = 3
+	defaultTargetRatio      = 0.8
+	defaultLokiTimeout      = 30 * time.Second
+	defaultInterval         = 5 * time.Minute
+	defaultMinInterval      = 5 * time.Second
+	defaultDiskGuardPercent = 90.0
+	regexExpectedGroups     = 3
 
 	unitKibi = 1024
 	unitKilo = 1000
@@ -51,9 +53,9 @@ const (
 
 // Config represents the top-level loki-prune configuration.
 type Config struct {
-	Daemon DaemonConfig `yaml:"daemon"`
 	Paths  []PathConfig `yaml:"paths"`
 	Loki   LokiConfig   `yaml:"loki"`
+	Daemon DaemonConfig `yaml:"daemon"`
 }
 
 // LokiConfig holds settings for communicating with the Loki API.
@@ -67,10 +69,14 @@ type LokiConfig struct {
 
 // DaemonConfig holds service and scheduling options.
 type DaemonConfig struct {
-	IntervalStr string        `yaml:"interval"`
-	LogLevel    string        `yaml:"log_level"`
-	LogType     string        `yaml:"log_type"`
-	Interval    time.Duration `yaml:"-"`
+	AdaptiveRaw    *bool         `yaml:"adaptive"`
+	IntervalStr    string        `yaml:"interval"`
+	MinIntervalStr string        `yaml:"min_interval"`
+	LogLevel       string        `yaml:"log_level"`
+	LogType        string        `yaml:"log_type"`
+	Interval       time.Duration `yaml:"-"`
+	MinInterval    time.Duration `yaml:"-"`
+	Adaptive       bool          `yaml:"-"`
 }
 
 // PathConfig defines rotation rules for a specific directory.
@@ -81,6 +87,7 @@ type PathConfig struct {
 	TriggerSizeStr   string         `yaml:"trigger_size"`
 	TargetSizeStr    string         `yaml:"target_size"`
 	Rotation         RotationConfig `yaml:"rotation"`
+	DiskGuardPercent float64        `yaml:"disk_guard_percent"`
 	TriggerSizeBytes int64          `yaml:"-"`
 	TargetSizeBytes  int64          `yaml:"-"`
 }
@@ -174,6 +181,22 @@ func (c *Config) validateDaemon() error {
 		c.Daemon.Interval = d
 	}
 
+	if c.Daemon.MinIntervalStr == "" {
+		c.Daemon.MinInterval = defaultMinInterval
+	} else {
+		d, err := time.ParseDuration(c.Daemon.MinIntervalStr)
+		if err != nil {
+			return fmt.Errorf("%w: daemon.min_interval: %w", ErrInvalidDuration, err)
+		}
+		c.Daemon.MinInterval = d
+	}
+
+	if c.Daemon.AdaptiveRaw != nil {
+		c.Daemon.Adaptive = *c.Daemon.AdaptiveRaw
+	} else {
+		c.Daemon.Adaptive = true
+	}
+
 	if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
 		c.Daemon.LogLevel = envLevel
 	} else if c.Daemon.LogLevel == "" {
@@ -204,6 +227,10 @@ func (c *Config) validatePath(idx int) error {
 
 	if p.ArchiveDir == "" {
 		p.ArchiveDir = filepath.Join(p.Path, "archive")
+	}
+
+	if p.DiskGuardPercent <= 0 {
+		p.DiskGuardPercent = defaultDiskGuardPercent
 	}
 
 	return c.validateCompression(idx)
@@ -246,7 +273,7 @@ func (c *Config) validateCompression(idx int) error {
 	p.Rotation.Type = strings.ToLower(p.Rotation.Type)
 
 	switch p.Rotation.Type {
-	case "zstd", "gzip", "none":
+	case "zstd", "gzip", "zip", "none":
 	default:
 		return fmt.Errorf("path[%d] (%s) %w: %s", idx, p.Name, ErrUnsupportedCompression, p.Rotation.Type)
 	}

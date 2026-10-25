@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,17 +15,21 @@ import (
 
 	"github.com/blackbirdworks/loki-prune/pkg/compressor"
 	"github.com/blackbirdworks/loki-prune/pkg/config"
+	"github.com/blackbirdworks/loki-prune/pkg/disk"
 	"github.com/blackbirdworks/loki-prune/pkg/logger"
 	"github.com/blackbirdworks/loki-prune/pkg/loki"
+	"github.com/blackbirdworks/loki-prune/pkg/tracker"
 )
 
 const (
-	dirPerm  = 0750
-	filePerm = 0600
+	dirPerm       = 0750
+	filePerm      = 0600
+	percentFactor = 100.0
 )
 
 // Rotator manages the monitoring, rotation, compression, and pruning for a path.
 type Rotator struct {
+	tracker    *tracker.Tracker
 	lokiClient *loki.Client
 	compressor *compressor.Compressor
 	cfg        config.PathConfig
@@ -33,33 +38,72 @@ type Rotator struct {
 
 // New creates a new Rotator instance for a path configuration.
 func New(pCfg config.PathConfig, lokiCfg config.LokiConfig, dryRun bool) (*Rotator, error) {
+	if pCfg.DiskGuardPercent <= 0 {
+		pCfg.DiskGuardPercent = 90.0
+	}
+
 	comp, err := compressor.New(pCfg.Rotation.Type, pCfg.Rotation.Level)
 	if err != nil {
 		return nil, fmt.Errorf("initializing compressor for %s: %w", pCfg.Name, err)
 	}
 
+	trk, trkErr := tracker.New(pCfg.Path, pCfg.ArchiveDir)
+	if trkErr != nil {
+		return nil, fmt.Errorf("initializing tracker for %s: %w", pCfg.Name, trkErr)
+	}
+	_, _, _ = trk.Sync()
+
 	return &Rotator{
 		cfg:        pCfg,
 		lokiClient: loki.NewClient(lokiCfg.URL, lokiCfg.Timeout),
 		compressor: comp,
+		tracker:    trk,
 		dryRun:     dryRun,
 	}, nil
 }
 
+// Tracker returns the underlying in-memory file tracker.
+func (r *Rotator) Tracker() *tracker.Tracker {
+	return r.tracker
+}
+
+// StartTracker starts the real-time filesystem event listener on the tracker.
+func (r *Rotator) StartTracker(ctx context.Context) {
+	if r.tracker != nil {
+		r.tracker.Start(ctx)
+	}
+}
+
+// Close releases resources held by the rotator, including the file tracker.
+func (r *Rotator) Close() error {
+	if r.tracker != nil {
+		return r.tracker.Close()
+	}
+
+	return nil
+}
+
 // Process runs a single evaluation and rotation cycle.
 func (r *Rotator) Process(ctx context.Context) error {
+	_, err := r.ProcessWithRatio(ctx)
+
+	return err
+}
+
+// ProcessWithRatio runs an evaluation cycle and returns the quota/disk pressure ratio (0.0 to >=1.0).
+func (r *Rotator) ProcessWithRatio(ctx context.Context) (float64, error) {
 	log := logger.FromContext(ctx)
 	log.InfoContext(ctx, "Evaluating path", "name", r.cfg.Name, "path", r.cfg.Path)
 
 	if _, err := os.Stat(r.cfg.Path); os.IsNotExist(err) {
 		log.WarnContext(ctx, "Path does not exist, skipping", "path", r.cfg.Path)
 
-		return nil
+		return 0, nil
 	}
 
 	currentSize, fileCount, err := r.calculateDirSize(r.cfg.Path)
 	if err != nil {
-		return fmt.Errorf("calculating directory size for %s: %w", r.cfg.Path, err)
+		return 0, fmt.Errorf("calculating directory size for %s: %w", r.cfg.Path, err)
 	}
 
 	log.InfoContext(ctx, "Path size status",
@@ -69,6 +113,12 @@ func (r *Rotator) Process(ctx context.Context) error {
 		"files", fileCount,
 	)
 
+	var ratio float64
+	if r.cfg.TriggerSizeBytes > 0 {
+		ratio = float64(currentSize) / float64(r.cfg.TriggerSizeBytes)
+	}
+
+	rotated := false
 	if currentSize > r.cfg.TriggerSizeBytes {
 		log.WarnContext(ctx, "Path size exceeded trigger limit, beginning rotation",
 			"name", r.cfg.Name,
@@ -77,7 +127,23 @@ func (r *Rotator) Process(ctx context.Context) error {
 		)
 
 		if rotErr := r.executeRotation(ctx, currentSize); rotErr != nil {
-			return fmt.Errorf("executing rotation on %s: %w", r.cfg.Name, rotErr)
+			return ratio, fmt.Errorf("executing rotation on %s: %w", r.cfg.Name, rotErr)
+		}
+		rotated = true
+	}
+
+	if usage, dErr := disk.Usage(r.cfg.Path); dErr == nil {
+		diskRatio := usage.UsedPercent / percentFactor
+		ratio = math.Max(ratio, diskRatio)
+		if usage.UsedPercent >= r.cfg.DiskGuardPercent && !rotated {
+			log.WarnContext(ctx, "Disk guard threshold exceeded, triggering emergency rotation",
+				"name", r.cfg.Name,
+				"used_percent", fmt.Sprintf("%.2f%%", usage.UsedPercent),
+				"guard_threshold", fmt.Sprintf("%.2f%%", r.cfg.DiskGuardPercent),
+			)
+			if rotErr := r.executeRotation(ctx, currentSize); rotErr != nil {
+				return ratio, fmt.Errorf("executing emergency disk guard rotation on %s: %w", r.cfg.Name, rotErr)
+			}
 		}
 	}
 
@@ -93,7 +159,7 @@ func (r *Rotator) Process(ctx context.Context) error {
 		}
 	}
 
-	return nil
+	return ratio, nil
 }
 
 type fileEntry struct {
@@ -178,10 +244,17 @@ func (r *Rotator) moveSingleItem(item fileEntry, targetDir string) error {
 		}
 	}
 
+	if r.tracker != nil {
+		r.tracker.Remove(item.path)
+	}
+
 	if item.path == r.cfg.Path {
 		emptyFile, createErr := os.OpenFile(r.cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
 		if createErr == nil {
 			_ = emptyFile.Close()
+		}
+		if r.tracker != nil {
+			_, _, _ = r.tracker.Sync()
 		}
 	}
 
@@ -393,12 +466,29 @@ func (r *Rotator) collectAllRotations(entries []os.DirEntry) []rotationItem {
 }
 
 func (r *Rotator) calculateDirSize(dir string) (int64, int, error) {
+	if r.tracker != nil && filepath.Clean(dir) == filepath.Clean(r.cfg.Path) {
+		sz, count := r.tracker.Size()
+		if count > 0 || sz > 0 {
+			return sz, count, nil
+		}
+
+		return r.tracker.Sync()
+	}
+
+	st, err := os.Stat(dir)
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat path %s: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return st.Size(), 1, nil
+	}
+
 	var totalSize int64
 	var fileCount int
 
 	cleanArchive := filepath.Clean(r.cfg.ArchiveDir)
 
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -419,14 +509,42 @@ func (r *Rotator) calculateDirSize(dir string) (int64, int, error) {
 		return nil
 	})
 
-	return totalSize, fileCount, err
+	return totalSize, fileCount, walkErr
 }
 
 func (r *Rotator) collectOldestItems(dir string) ([]fileEntry, error) {
+	if r.tracker != nil && filepath.Clean(dir) == filepath.Clean(r.cfg.Path) {
+		cached := r.tracker.OldestItems()
+		if len(cached) > 0 {
+			entries := make([]fileEntry, len(cached))
+			for i, e := range cached {
+				entries[i] = fileEntry{
+					path:    e.Path,
+					size:    e.Size,
+					modTime: e.ModTime,
+				}
+			}
+
+			return entries, nil
+		}
+	}
+
+	st, err := os.Stat(dir)
+	if err != nil {
+		return nil, fmt.Errorf("stat path %s: %w", dir, err)
+	}
+	if !st.IsDir() {
+		return []fileEntry{{
+			path:    dir,
+			size:    st.Size(),
+			modTime: st.ModTime(),
+		}}, nil
+	}
+
 	var entries []fileEntry
 	cleanArchive := filepath.Clean(r.cfg.ArchiveDir)
 
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -450,8 +568,8 @@ func (r *Rotator) collectOldestItems(dir string) ([]fileEntry, error) {
 		return nil
 	})
 
-	if err != nil {
-		return nil, err
+	if walkErr != nil {
+		return nil, walkErr
 	}
 
 	sort.Slice(entries, func(i, j int) bool {

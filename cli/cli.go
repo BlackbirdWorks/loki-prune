@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -100,27 +102,21 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 		"paths_count", len(cfg.Paths),
 	)
 
-	rotators := make([]*rotator.Rotator, 0, len(cfg.Paths))
-	for _, p := range cfg.Paths {
-		r, rErr := rotator.New(p, cfg.Loki, c.DryRun)
-		if rErr != nil {
-			return fmt.Errorf("%w: %s: %w", ErrInitRotator, p.Name, rErr)
-		}
-		rotators = append(rotators, r)
+	rotators, events, rErr := initRotators(ctx, cfg, c.DryRun)
+	if rErr != nil {
+		return rErr
 	}
-
-	runCycle := func() {
+	defer func() {
 		for _, r := range rotators {
-			if ctx.Err() != nil {
-				return
-			}
-			if pErr := r.Process(ctx); pErr != nil {
-				appLog.ErrorContext(ctx, "Error during rotation process", "err", pErr)
-			}
+			_ = r.Close()
 		}
+	}()
+
+	runCycle := func() float64 {
+		return runCycleOnce(ctx, rotators)
 	}
 
-	runCycle()
+	initialRatio := runCycle()
 
 	if c.Once {
 		appLog.InfoContext(ctx, "Completed single run cycle, exiting.")
@@ -128,19 +124,149 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 		return nil
 	}
 
-	return c.RunDaemon(ctx, cfg.Daemon.Interval, runCycle)
+	return c.RunDaemonAdaptive(
+		ctx,
+		cfg.Daemon.Interval,
+		cfg.Daemon.MinInterval,
+		cfg.Daemon.Adaptive,
+		initialRatio,
+		events,
+		runCycle,
+	)
+}
+
+func initRotators(
+	ctx context.Context,
+	cfg *config.Config,
+	dryRun bool,
+) ([]*rotator.Rotator, <-chan struct{}, error) {
+	rotators := make([]*rotator.Rotator, 0, len(cfg.Paths))
+	combinedEvents := make(chan struct{}, 1)
+
+	for _, p := range cfg.Paths {
+		r, rErr := rotator.New(p, cfg.Loki, dryRun)
+		if rErr != nil {
+			return nil, nil, fmt.Errorf("%w: %s: %w", ErrInitRotator, p.Name, rErr)
+		}
+		r.StartTracker(ctx)
+		rotators = append(rotators, r)
+
+		if trk := r.Tracker(); trk != nil {
+			forwardTrackerEvents(ctx, trk.Events(), combinedEvents)
+		}
+	}
+
+	return rotators, combinedEvents, nil
+}
+
+func forwardTrackerEvents(ctx context.Context, in <-chan struct{}, out chan<- struct{}) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-in:
+				if !ok {
+					return
+				}
+				select {
+				case out <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+}
+
+func runCycleOnce(ctx context.Context, rotators []*rotator.Rotator) float64 {
+	log := logger.FromContext(ctx)
+	var maxRatio float64
+	for _, r := range rotators {
+		if ctx.Err() != nil {
+			return maxRatio
+		}
+		ratio, pErr := r.ProcessWithRatio(ctx)
+		if pErr != nil {
+			log.ErrorContext(ctx, "Error during rotation process", "err", pErr)
+		}
+		if ratio > maxRatio {
+			maxRatio = ratio
+		}
+	}
+
+	return maxRatio
+}
+
+// ComputeNextInterval calculates the next sleep duration based on quota/disk ratio and adaptive settings.
+func ComputeNextInterval(interval, minInterval time.Duration, adaptive bool, ratio float64) time.Duration {
+	if !adaptive || minInterval <= 0 || minInterval >= interval {
+		return interval
+	}
+
+	const threshold = 0.5
+	switch {
+	case ratio >= 1.0:
+		return minInterval
+	case ratio > threshold:
+		factor := (1.0 - ratio) / threshold
+		diff := float64(interval - minInterval)
+
+		return minInterval + time.Duration(factor*diff)
+	default:
+		return interval
+	}
 }
 
 // RunDaemon runs a continuous ticker loop executing the provided cycle function until the context is canceled.
 func (c *CLI) RunDaemon(ctx context.Context, interval time.Duration, runCycle func()) error {
+	return c.RunDaemonAdaptive(ctx, interval, interval, false, 0, nil, func() float64 {
+		runCycle()
+
+		return 0
+	})
+}
+
+// RunDaemonAdaptive runs an adaptive timer loop executing runCycle until context is canceled.
+func (c *CLI) RunDaemonAdaptive(
+	ctx context.Context,
+	interval, minInterval time.Duration,
+	adaptive bool,
+	initialRatio float64,
+	events <-chan struct{},
+	runCycle func() float64,
+) error {
 	appLog := logger.FromContext(ctx)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	currentInterval := ComputeNextInterval(interval, minInterval, adaptive, initialRatio)
+	timer := time.NewTimer(currentInterval)
+	defer timer.Stop()
 
 	var running sync.Mutex
 	var wg sync.WaitGroup
+	var latestRatioBits atomic.Uint64
+	latestRatioBits.Store(math.Float64bits(initialRatio))
 
-	appLog.InfoContext(ctx, "Entering daemon loop", "interval", interval)
+	appLog.InfoContext(ctx, "Entering daemon loop",
+		"interval", interval,
+		"min_interval", minInterval,
+		"adaptive", adaptive,
+		"initial_interval", currentInterval,
+	)
+
+	triggerCycle := func() {
+		if running.TryLock() {
+			wg.Go(func() {
+				defer running.Unlock()
+				ratio := runCycle()
+				latestRatioBits.Store(math.Float64bits(ratio))
+			})
+		} else {
+			appLog.WarnContext(ctx, "Previous cycle still in progress, skipping this tick")
+		}
+
+		ratio := math.Float64frombits(latestRatioBits.Load())
+		currentInterval = ComputeNextInterval(interval, minInterval, adaptive, ratio)
+		timer.Reset(currentInterval)
+	}
 
 	for {
 		select {
@@ -150,15 +276,11 @@ func (c *CLI) RunDaemon(ctx context.Context, interval time.Duration, runCycle fu
 			appLog.InfoContext(ctx, "Termination complete.")
 
 			return nil
-		case <-ticker.C:
-			if running.TryLock() {
-				wg.Go(func() {
-					defer running.Unlock()
-					runCycle()
-				})
-			} else {
-				appLog.WarnContext(ctx, "Previous cycle still in progress, skipping this tick")
-			}
+		case <-timer.C:
+			triggerCycle()
+		case <-events:
+			appLog.DebugContext(ctx, "Realtime filesystem event detected")
+			triggerCycle()
 		}
 	}
 }
