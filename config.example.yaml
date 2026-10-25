@@ -32,11 +32,11 @@ paths:
       # Compression settings
       compress: true
       type: "zstd"             # "zstd", "gzip", or "none"
-      level: 3                 # Compression level (1-19 for zstd, 1-9 for gzip)
+      level: 19                # Compression level (1-19 for zstd; 19 is highest compression)
 
       # Delayed compression options
       delay:
-        # Keep the newest N rotation batches uncompressed before compressing them
-        rotations: 2
-        # Or only compress rotations older than this duration (e.g. "24h", "7d")
-        age: "24h"
+        # Number of recent rotation batches to keep uncompressed before compressing them
+        rotations: 0
+        # Wait duration before compressing rotated items (e.g. "1m" to allow flushing)
+        age: "1m"
