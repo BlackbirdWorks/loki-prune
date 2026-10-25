@@ -16,91 +16,87 @@ import (
 func TestRunCLI(t *testing.T) {
 	t.Parallel()
 
-	type testCase struct {
-		setup   func(t *testing.T) (args []string, cleanup func())
+	tests := []struct {
+		setup   func(t *testing.T) []string
+		wantErr func(t *testing.T, err error)
 		name    string
-		wantErr bool
-	}
-
-	tests := []testCase{
+	}{
 		{
 			name: "help flag",
-			setup: func(_ *testing.T) ([]string, func()) {
-				return []string{"--help"}, func() {}
+			setup: func(_ *testing.T) []string {
+				return []string{"--help"}
 			},
-			wantErr: false,
+			wantErr: nil,
 		},
 		{
 			name: "version flag",
-			setup: func(_ *testing.T) ([]string, func()) {
-				return []string{"--version"}, func() {}
+			setup: func(_ *testing.T) []string {
+				return []string{"--version"}
 			},
-			wantErr: false,
+			wantErr: nil,
 		},
 		{
 			name: "invalid flag",
-			setup: func(_ *testing.T) ([]string, func()) {
-				return []string{"--invalid-flag-that-does-not-exist"}, func() {}
+			setup: func(_ *testing.T) []string {
+				return []string{"--invalid-flag-that-does-not-exist"}
 			},
-			wantErr: true,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				assert.Error(t, err)
+			},
 		},
 		{
 			name: "valid config with once and dry-run",
-			setup: func(t *testing.T) ([]string, func()) {
+			setup: func(t *testing.T) []string {
 				t.Helper()
 				tempDir := t.TempDir()
 				cfgPath := filepath.Join(tempDir, "config.yaml")
-				content := `
-paths:
-  - path: "` + tempDir + `"
-    trigger_size: "10GB"
-`
+				content := "paths:\n  - path: \"" + tempDir + "\"\n    trigger_size: \"10GB\"\n"
 				require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0600))
 
-				return []string{"--config", cfgPath, "--once", "--dry-run"}, func() {}
+				return []string{"--config", cfgPath, "--once", "--dry-run"}
 			},
-			wantErr: false,
+			wantErr: nil,
 		},
 		{
 			name: "missing config file",
-			setup: func(_ *testing.T) ([]string, func()) {
-				return []string{"--config", "/non/existent/config.yaml", "--once"}, func() {}
+			setup: func(_ *testing.T) []string {
+				return []string{"--config", "/non/existent/config.yaml", "--once"}
 			},
-			wantErr: true,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				assert.Error(t, err)
+			},
 		},
 		{
 			name: "invalid path config causes rotator error",
-			setup: func(t *testing.T) ([]string, func()) {
+			setup: func(t *testing.T) []string {
 				t.Helper()
 				tempDir := t.TempDir()
 				cfgPath := filepath.Join(tempDir, "config.yaml")
-				content := `
-paths:
-  - path: "` + tempDir + `"
-    trigger_size: "10GB"
-    rotation:
-      type: "unsupported"
-`
+				content := "paths:\n  - path: \"" + tempDir + "\"\n" +
+					"    trigger_size: \"10GB\"\n    rotation:\n      type: \"unsupported\"\n"
 				require.NoError(t, os.WriteFile(cfgPath, []byte(content), 0600))
 
-				return []string{"--config", cfgPath, "--once"}, func() {}
+				return []string{"--config", cfgPath, "--once"}
 			},
-			wantErr: true,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				assert.Error(t, err)
+			},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			args, cleanup := tc.setup(t)
-			defer cleanup()
+			args := tc.setup(t)
 
 			var out bytes.Buffer
 			var errOut bytes.Buffer
-
 			err := RunCLI(args, &out, &errOut)
-			if tc.wantErr {
-				require.Error(t, err)
+			if tc.wantErr != nil {
+				tc.wantErr(t, err)
 			} else {
 				require.NoError(t, err)
 			}
@@ -111,13 +107,11 @@ paths:
 func TestRunMain(t *testing.T) {
 	t.Parallel()
 
-	type testCase struct {
+	tests := []struct {
 		name         string
 		args         []string
 		expectedCode int
-	}
-
-	tests := []testCase{
+	}{
 		{
 			name:         "help returns zero exit code",
 			args:         []string{"--help"},
@@ -142,22 +136,34 @@ func TestRunMain(t *testing.T) {
 func TestRunDaemon(t *testing.T) {
 	t.Parallel()
 
-	cli := &CLI{}
-	ctx, cancel := context.WithCancel(context.Background())
-	var count atomic.Int32
+	tests := []struct {
+		name     string
+		interval time.Duration
+	}{
+		{name: "daemon runs tick and shuts down on context cancel", interval: 10 * time.Millisecond},
+	}
 
-	done := make(chan struct{})
-	go func() {
-		_ = cli.runDaemon(ctx, 10*time.Millisecond, func() {
-			count.Add(1)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cli := &CLI{}
+			ctx, cancel := context.WithCancel(context.Background())
+			var count atomic.Int32
+
+			done := make(chan struct{})
+			go func() {
+				_ = cli.runDaemon(ctx, tc.interval, func() {
+					count.Add(1)
+				})
+				close(done)
+			}()
+
+			assert.Eventually(t, func() bool {
+				return count.Load() >= 1
+			}, 2*time.Second, 10*time.Millisecond)
+
+			cancel()
+			<-done
 		})
-		close(done)
-	}()
-
-	assert.Eventually(t, func() bool {
-		return count.Load() >= 1
-	}, 2*time.Second, 10*time.Millisecond)
-
-	cancel()
-	<-done
+	}
 }

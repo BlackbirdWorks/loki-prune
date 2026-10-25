@@ -14,13 +14,11 @@ import (
 func TestParseLevel(t *testing.T) {
 	t.Parallel()
 
-	type testCase struct {
+	tests := []struct {
 		name     string
 		input    string
 		expected slog.Level
-	}
-
-	tests := []testCase{
+	}{
 		{name: "debug", input: "debug", expected: slog.LevelDebug},
 		{name: "warn", input: "warn", expected: slog.LevelWarn},
 		{name: "warning", input: "warning", expected: slog.LevelWarn},
@@ -41,14 +39,12 @@ func TestParseLevel(t *testing.T) {
 func TestNew(t *testing.T) {
 	t.Parallel()
 
-	type testCase struct {
+	tests := []struct {
 		validate func(t *testing.T, output string)
 		name     string
 		logType  string
 		level    slog.Level
-	}
-
-	tests := []testCase{
+	}{
 		{
 			name:    "text logger",
 			logType: "text",
@@ -89,41 +85,115 @@ func TestNew(t *testing.T) {
 	}
 }
 
-func TestContextPropagation(t *testing.T) {
+func TestInto(t *testing.T) {
 	t.Parallel()
 
-	t.Run("nil context returns discard logger", func(t *testing.T) {
-		t.Parallel()
-		var nilCtx context.Context
-		l := logger.FromContext(nilCtx)
-		assert.NotNil(t, l)
-	})
+	tests := []struct {
+		setup func() (context.Context, *slog.Logger)
+		name  string
+	}{
+		{
+			name: "standard logger injection",
+			setup: func() (context.Context, *slog.Logger) {
+				var buf bytes.Buffer
 
-	t.Run("context without logger returns discard logger", func(t *testing.T) {
-		t.Parallel()
-		l := logger.FromContext(context.Background())
-		assert.NotNil(t, l)
-	})
+				return context.Background(), logger.New(&buf, "text", slog.LevelInfo)
+			},
+		},
+		{
+			name: "nil logger injection",
+			setup: func() (context.Context, *slog.Logger) {
+				return context.Background(), nil
+			},
+		},
+	}
 
-	t.Run("inject and extract logger", func(t *testing.T) {
-		t.Parallel()
-		var buf bytes.Buffer
-		baseLogger := logger.New(&buf, "text", slog.LevelInfo)
-		ctx := logger.Into(context.Background(), baseLogger)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, l := tc.setup()
+			resCtx := logger.Into(ctx, l)
+			assert.NotNil(t, resCtx)
+		})
+	}
+}
 
-		retrieved := logger.FromContext(ctx)
-		retrieved.Info("hello from context")
-		assert.Contains(t, buf.String(), "hello from context")
-	})
+func TestFromContext(t *testing.T) {
+	t.Parallel()
 
-	t.Run("with adds attributes", func(t *testing.T) {
-		t.Parallel()
-		var buf bytes.Buffer
-		baseLogger := logger.New(&buf, "text", slog.LevelInfo)
-		ctx := logger.Into(context.Background(), baseLogger)
+	tests := []struct {
+		setup func() (context.Context, func(t *testing.T, l *slog.Logger))
+		name  string
+	}{
+		{
+			name: "nil context returns discard logger",
+			setup: func() (context.Context, func(t *testing.T, l *slog.Logger)) {
+				var nilCtx context.Context
 
-		ctxWithAttr := logger.With(ctx, "service", "loki-prune")
-		logger.FromContext(ctxWithAttr).Info("operational")
-		assert.Contains(t, buf.String(), "service=loki-prune")
-	})
+				return nilCtx, func(t *testing.T, l *slog.Logger) {
+					t.Helper()
+					assert.NotNil(t, l)
+				}
+			},
+		},
+		{
+			name: "empty context without logger returns discard logger",
+			setup: func() (context.Context, func(t *testing.T, l *slog.Logger)) {
+				return context.Background(), func(t *testing.T, l *slog.Logger) {
+					t.Helper()
+					assert.NotNil(t, l)
+				}
+			},
+		},
+		{
+			name: "context with injected logger retrieves same logger",
+			setup: func() (context.Context, func(t *testing.T, l *slog.Logger)) {
+				var buf bytes.Buffer
+				orig := logger.New(&buf, "text", slog.LevelInfo)
+				ctx := logger.Into(context.Background(), orig)
+
+				return ctx, func(t *testing.T, l *slog.Logger) {
+					t.Helper()
+					l.Info("from context")
+					assert.Contains(t, buf.String(), "from context")
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx, verify := tc.setup()
+			l := logger.FromContext(ctx)
+			verify(t, l)
+		})
+	}
+}
+
+func TestWith(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		attrs []any
+	}{
+		{
+			name:  "adds attributes to context logger",
+			attrs: []any{"component", "tester"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			base := logger.New(&buf, "text", slog.LevelInfo)
+			ctx := logger.Into(context.Background(), base)
+
+			ctxWith := logger.With(ctx, tc.attrs...)
+			logger.FromContext(ctxWith).Info("test")
+			assert.Contains(t, buf.String(), "component=tester")
+		})
+	}
 }
