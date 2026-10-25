@@ -47,13 +47,21 @@ func New(cType string, level int) (*Compressor, error) {
 	norm := strings.ToLower(strings.TrimSpace(cType))
 	switch norm {
 	case "zstd", "":
-		return &Compressor{compType: TypeZstd, level: level}, nil
+		return NewWithType(TypeZstd, level), nil
 	case "gzip", "gz":
-		return &Compressor{compType: TypeGzip, level: level}, nil
+		return NewWithType(TypeGzip, level), nil
 	case "none":
-		return &Compressor{compType: TypeNone, level: 0}, nil
+		return NewWithType(TypeNone, 0), nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedCompression, cType)
+	}
+}
+
+// NewWithType creates a Compressor with an explicit CompressionType.
+func NewWithType(compType CompressionType, level int) *Compressor {
+	return &Compressor{
+		compType: compType,
+		level:    level,
 	}
 }
 

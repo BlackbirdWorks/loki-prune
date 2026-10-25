@@ -181,7 +181,7 @@ func TestCompressor_UnknownType(t *testing.T) {
 	require.NoError(t, os.Mkdir(src, 0750))
 
 	// Directly constructing an unknown compressor type
-	invalidComp := compressor.NewTestCompressor("invalid_algorithm")
+	invalidComp := compressor.NewWithType("invalid_algorithm", 0)
 	assert.Equal(t, ".tar", invalidComp.Extension())
 
 	err := invalidComp.CompressDirectory(src, filepath.Join(tmp, "out.tar"))

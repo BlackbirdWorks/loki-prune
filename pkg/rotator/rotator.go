@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/blackbirdworks/loki-prune/pkg/compressor"
 	"github.com/blackbirdworks/loki-prune/pkg/config"
+	"github.com/blackbirdworks/loki-prune/pkg/logger"
 	"github.com/blackbirdworks/loki-prune/pkg/loki"
 )
 
@@ -26,37 +26,32 @@ const (
 type Rotator struct {
 	lokiClient *loki.Client
 	compressor *compressor.Compressor
-	logger     *slog.Logger
 	cfg        config.PathConfig
 	dryRun     bool
 }
 
 // New creates a new Rotator instance for a path configuration.
-func New(pCfg config.PathConfig, lokiCfg config.LokiConfig, logger *slog.Logger, dryRun bool) (*Rotator, error) {
+func New(pCfg config.PathConfig, lokiCfg config.LokiConfig, dryRun bool) (*Rotator, error) {
 	comp, err := compressor.New(pCfg.Rotation.Type, pCfg.Rotation.Level)
 	if err != nil {
 		return nil, fmt.Errorf("initializing compressor for %s: %w", pCfg.Name, err)
-	}
-
-	if logger == nil {
-		logger = slog.Default()
 	}
 
 	return &Rotator{
 		cfg:        pCfg,
 		lokiClient: loki.NewClient(lokiCfg.URL, lokiCfg.Timeout),
 		compressor: comp,
-		logger:     logger,
 		dryRun:     dryRun,
 	}, nil
 }
 
 // Process runs a single evaluation and rotation cycle.
 func (r *Rotator) Process(ctx context.Context) error {
-	r.logger.InfoContext(ctx, "Evaluating path", "name", r.cfg.Name, "path", r.cfg.Path)
+	log := logger.FromContext(ctx)
+	log.InfoContext(ctx, "Evaluating path", "name", r.cfg.Name, "path", r.cfg.Path)
 
 	if _, err := os.Stat(r.cfg.Path); os.IsNotExist(err) {
-		r.logger.WarnContext(ctx, "Path does not exist, skipping", "path", r.cfg.Path)
+		log.WarnContext(ctx, "Path does not exist, skipping", "path", r.cfg.Path)
 
 		return nil
 	}
@@ -66,7 +61,7 @@ func (r *Rotator) Process(ctx context.Context) error {
 		return fmt.Errorf("calculating directory size for %s: %w", r.cfg.Path, err)
 	}
 
-	r.logger.InfoContext(ctx, "Path size status",
+	log.InfoContext(ctx, "Path size status",
 		"name", r.cfg.Name,
 		"current", config.FormatBytes(currentSize),
 		"trigger", config.FormatBytes(r.cfg.TriggerSizeBytes),
@@ -74,7 +69,7 @@ func (r *Rotator) Process(ctx context.Context) error {
 	)
 
 	if currentSize > r.cfg.TriggerSizeBytes {
-		r.logger.WarnContext(ctx, "Path size exceeded trigger limit, beginning rotation",
+		log.WarnContext(ctx, "Path size exceeded trigger limit, beginning rotation",
 			"name", r.cfg.Name,
 			"current", config.FormatBytes(currentSize),
 			"trigger", config.FormatBytes(r.cfg.TriggerSizeBytes),
@@ -87,13 +82,13 @@ func (r *Rotator) Process(ctx context.Context) error {
 
 	if r.cfg.Rotation.Compress {
 		if compErr := r.processCompression(ctx); compErr != nil {
-			r.logger.ErrorContext(ctx, "Error during compression cycle", "name", r.cfg.Name, "err", compErr)
+			log.ErrorContext(ctx, "Error during compression cycle", "name", r.cfg.Name, "err", compErr)
 		}
 	}
 
 	if r.cfg.Rotation.MaxRotations > 0 {
 		if pruneErr := r.enforceMaxRotations(ctx); pruneErr != nil {
-			r.logger.ErrorContext(ctx, "Error enforcing max rotations", "name", r.cfg.Name, "err", pruneErr)
+			log.ErrorContext(ctx, "Error enforcing max rotations", "name", r.cfg.Name, "err", pruneErr)
 		}
 	}
 
@@ -127,7 +122,8 @@ func (r *Rotator) executeRotation(ctx context.Context, currentSize int64) error 
 
 	movedBytes, movedCount := r.moveBatch(ctx, items, bytesToFree, rotationDirPath)
 
-	r.logger.InfoContext(ctx, "Rotation batch staged",
+	log := logger.FromContext(ctx)
+	log.InfoContext(ctx, "Rotation batch staged",
 		"directory", rotationDirPath,
 		"items_moved", movedCount,
 		"freed_bytes", config.FormatBytes(movedBytes),
@@ -140,21 +136,23 @@ func (r *Rotator) executeRotation(ctx context.Context, currentSize int64) error 
 }
 
 func (r *Rotator) flushLokiBefore(ctx context.Context) {
-	r.logger.InfoContext(ctx, "Flushing Loki before rotating")
+	log := logger.FromContext(ctx)
+	log.InfoContext(ctx, "Flushing Loki before rotating")
 	if !r.dryRun {
 		if err := r.lokiClient.Flush(ctx); err != nil {
-			r.logger.WarnContext(ctx, "Loki flush failed (proceeding with caution)", "err", err)
+			log.WarnContext(ctx, "Loki flush failed (proceeding with caution)", "err", err)
 		} else {
-			r.logger.InfoContext(ctx, "Loki flush completed successfully")
+			log.InfoContext(ctx, "Loki flush completed successfully")
 		}
 	}
 }
 
 func (r *Rotator) syncLokiAfter(ctx context.Context) {
-	r.logger.InfoContext(ctx, "Synchronizing Loki after rotation")
+	log := logger.FromContext(ctx)
+	log.InfoContext(ctx, "Synchronizing Loki after rotation")
 	if !r.dryRun {
 		if err := r.lokiClient.Reload(ctx); err != nil {
-			r.logger.WarnContext(ctx, "Loki reload after rotation returned error", "err", err)
+			log.WarnContext(ctx, "Loki reload after rotation returned error", "err", err)
 		}
 	}
 }
@@ -193,6 +191,7 @@ func (r *Rotator) moveBatch(
 	bytesToFree int64,
 	targetDir string,
 ) (int64, int) {
+	log := logger.FromContext(ctx)
 	var movedBytes int64
 	var movedCount int
 
@@ -203,7 +202,7 @@ func (r *Rotator) moveBatch(
 
 		if !r.dryRun {
 			if err := r.moveSingleItem(item, targetDir); err != nil {
-				r.logger.WarnContext(ctx, "Failed to move item, skipping", "err", err)
+				log.WarnContext(ctx, "Failed to move item, skipping", "err", err)
 
 				continue
 			}
@@ -226,6 +225,7 @@ func (r *Rotator) processCompression(ctx context.Context) error {
 		return err
 	}
 
+	log := logger.FromContext(ctx)
 	uncompressed := r.getUncompressedRotations(entries)
 	now := time.Now()
 
@@ -237,7 +237,7 @@ func (r *Rotator) processCompression(ctx context.Context) error {
 		srcDir := filepath.Join(r.cfg.ArchiveDir, dirInfo.Name())
 		archiveFile := srcDir + r.compressor.Extension()
 
-		r.logger.InfoContext(ctx, "Compressing rotation archive",
+		log.InfoContext(ctx, "Compressing rotation archive",
 			"source", srcDir,
 			"target", archiveFile,
 			"type", r.cfg.Rotation.Type,
@@ -249,15 +249,15 @@ func (r *Rotator) processCompression(ctx context.Context) error {
 		}
 
 		if compErr := r.compressor.CompressDirectory(srcDir, archiveFile); compErr != nil {
-			r.logger.ErrorContext(ctx, "Failed to compress rotation", "dir", srcDir, "err", compErr)
+			log.ErrorContext(ctx, "Failed to compress rotation", "dir", srcDir, "err", compErr)
 
 			continue
 		}
 
 		if rmErr := os.RemoveAll(srcDir); rmErr != nil {
-			r.logger.WarnContext(ctx, "Failed to remove raw directory after compression", "dir", srcDir, "err", rmErr)
+			log.WarnContext(ctx, "Failed to remove raw directory after compression", "dir", srcDir, "err", rmErr)
 		} else {
-			r.logger.InfoContext(ctx, "Compression complete, raw directory purged", "archive", archiveFile)
+			log.InfoContext(ctx, "Compression complete, raw directory purged", "archive", archiveFile)
 		}
 	}
 
@@ -322,13 +322,14 @@ func (r *Rotator) enforceMaxRotations(ctx context.Context) error {
 		return allRotations[i].modTime.Before(allRotations[j].modTime)
 	})
 
+	log := logger.FromContext(ctx)
 	toDelete := len(allRotations) - limit
 	for idx := range toDelete {
 		target := allRotations[idx].path
-		r.logger.InfoContext(ctx, "Pruning expired rotation", "target", target, "limit", limit)
+		log.InfoContext(ctx, "Pruning expired rotation", "target", target, "limit", limit)
 		if !r.dryRun {
 			if rmErr := os.RemoveAll(target); rmErr != nil {
-				r.logger.ErrorContext(ctx, "Failed to remove expired rotation", "target", target, "err", rmErr)
+				log.ErrorContext(ctx, "Failed to remove expired rotation", "target", target, "err", rmErr)
 			}
 		}
 	}

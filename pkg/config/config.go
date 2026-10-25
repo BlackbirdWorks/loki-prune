@@ -69,6 +69,7 @@ type LokiConfig struct {
 type DaemonConfig struct {
 	IntervalStr string        `yaml:"interval"`
 	LogLevel    string        `yaml:"log_level"`
+	LogType     string        `yaml:"log_type"`
 	Interval    time.Duration `yaml:"-"`
 }
 
@@ -174,7 +175,19 @@ func (c *Config) validateDaemon() error {
 	}
 
 	if c.Daemon.LogLevel == "" {
-		c.Daemon.LogLevel = "info"
+		if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
+			c.Daemon.LogLevel = envLevel
+		} else {
+			c.Daemon.LogLevel = "info"
+		}
+	}
+
+	if c.Daemon.LogType == "" {
+		if envType := os.Getenv("LOG_TYPE"); envType != "" {
+			c.Daemon.LogType = envType
+		} else {
+			c.Daemon.LogType = "text"
+		}
 	}
 
 	return nil

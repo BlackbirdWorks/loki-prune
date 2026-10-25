@@ -139,31 +139,6 @@ func TestRunMain(t *testing.T) {
 	}
 }
 
-func TestSetupLogging(t *testing.T) {
-	t.Parallel()
-
-	type testCase struct {
-		level string
-	}
-
-	tests := []testCase{
-		{level: "debug"},
-		{level: "warn"},
-		{level: "error"},
-		{level: "info"},
-		{level: "unknown"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.level, func(t *testing.T) {
-			t.Parallel()
-			var buf bytes.Buffer
-			logger := setupLogging(tc.level, &buf)
-			assert.NotNil(t, logger)
-		})
-	}
-}
-
 func TestRunDaemon(t *testing.T) {
 	t.Parallel()
 
@@ -173,9 +148,7 @@ func TestRunDaemon(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		var buf bytes.Buffer
-		logger := setupLogging("info", &buf)
-		_ = cli.runDaemon(ctx, 10*time.Millisecond, logger, func() {
+		_ = cli.runDaemon(ctx, 10*time.Millisecond, func() {
 			count.Add(1)
 		})
 		close(done)

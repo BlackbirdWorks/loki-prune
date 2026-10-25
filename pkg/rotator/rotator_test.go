@@ -2,7 +2,6 @@ package rotator_test
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,10 +16,6 @@ import (
 	"github.com/blackbirdworks/loki-prune/pkg/rotator"
 )
 
-func nullLogger() *slog.Logger {
-	return slog.New(slog.DiscardHandler)
-}
-
 func TestNew(t *testing.T) {
 	t.Parallel()
 
@@ -33,7 +28,6 @@ func TestNew(t *testing.T) {
 	tests := []testCase{
 		{name: "valid zstd", cType: "zstd", wantErr: false},
 		{name: "invalid type", cType: "invalid-type", wantErr: true},
-		{name: "nil logger fallback", cType: "zstd", wantErr: false},
 	}
 
 	for _, tc := range tests {
@@ -42,11 +36,7 @@ func TestNew(t *testing.T) {
 			pCfg := config.PathConfig{
 				Rotation: config.RotationConfig{Type: tc.cType},
 			}
-			var l *slog.Logger
-			if tc.name != "nil logger fallback" {
-				l = nullLogger()
-			}
-			r, err := rotator.New(pCfg, config.LokiConfig{}, l, false)
+			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 			if tc.wantErr {
 				require.Error(t, err)
 				assert.Nil(t, r)
@@ -163,7 +153,7 @@ func TestRotator_Process_Scenarios(t *testing.T) {
 				Timeout: 2 * time.Second,
 			}
 
-			r, err := rotator.New(pCfg, lokiCfg, nullLogger(), tc.dryRun)
+			r, err := rotator.New(pCfg, lokiCfg, tc.dryRun)
 			require.NoError(t, err)
 
 			require.NoError(t, r.Process(context.Background()))
@@ -238,7 +228,7 @@ func TestRotator_DelayedCompression_Table(t *testing.T) {
 				},
 			}
 
-			r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 			require.NoError(t, err)
 
 			require.NoError(t, r.Process(context.Background()))
@@ -287,7 +277,7 @@ func TestRotator_EnforceMaxRotations(t *testing.T) {
 		},
 	}
 
-	r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+	r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Process(context.Background()))
@@ -319,7 +309,7 @@ func TestRotator_SingleFileRotation(t *testing.T) {
 		},
 	}
 
-	r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+	r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Process(context.Background()))
@@ -374,7 +364,7 @@ func TestRotator_AgeDelayAndLokiErrors(t *testing.T) {
 		Timeout: 1 * time.Second,
 	}
 
-	r, err := rotator.New(pCfg, lokiCfg, nullLogger(), false)
+	r, err := rotator.New(pCfg, lokiCfg, false)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Process(context.Background()))
@@ -402,7 +392,7 @@ func TestRotator_NonExistentPath(t *testing.T) {
 		TargetSizeBytes:  500,
 	}
 
-	r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+	r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Process(context.Background()))
@@ -431,7 +421,7 @@ func TestRotator_Errors(t *testing.T) {
 			},
 		}
 
-		r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+		r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 		require.NoError(t, err)
 
 		// Process should not fatal, but log errors
@@ -458,7 +448,7 @@ func TestRotator_Errors(t *testing.T) {
 			TargetSizeBytes:  500,
 		}
 
-		r, err := rotator.New(pCfg, config.LokiConfig{}, nullLogger(), false)
+		r, err := rotator.New(pCfg, config.LokiConfig{}, false)
 		require.NoError(t, err)
 
 		require.Error(t, r.Process(context.Background()))

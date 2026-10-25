@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -16,6 +15,7 @@ import (
 	kongyaml "github.com/alecthomas/kong-yaml"
 
 	"github.com/blackbirdworks/loki-prune/pkg/config"
+	"github.com/blackbirdworks/loki-prune/pkg/logger"
 	"github.com/blackbirdworks/loki-prune/pkg/rotator"
 	"github.com/blackbirdworks/loki-prune/pkg/version"
 )
@@ -84,9 +84,10 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 		return fmt.Errorf("loading config: %w", err)
 	}
 
-	logger := setupLogging(cfg.Daemon.LogLevel, out)
+	appLog := logger.New(out, cfg.Daemon.LogType, logger.ParseLevel(cfg.Daemon.LogLevel))
+	ctx = logger.Into(ctx, appLog)
 
-	logger.InfoContext(ctx, "Starting loki-prune",
+	appLog.InfoContext(ctx, "Starting loki-prune",
 		"version", version.BuildVersion,
 		"dry_run", c.DryRun,
 		"once", c.Once,
@@ -95,7 +96,7 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 
 	rotators := make([]*rotator.Rotator, 0, len(cfg.Paths))
 	for _, p := range cfg.Paths {
-		r, rErr := rotator.New(p, cfg.Loki, logger, c.DryRun)
+		r, rErr := rotator.New(p, cfg.Loki, c.DryRun)
 		if rErr != nil {
 			return fmt.Errorf("%w: %s: %w", ErrInitRotator, p.Name, rErr)
 		}
@@ -104,8 +105,11 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 
 	runCycle := func() {
 		for _, r := range rotators {
+			if ctx.Err() != nil {
+				return
+			}
 			if pErr := r.Process(ctx); pErr != nil {
-				logger.ErrorContext(ctx, "Error during rotation process", "err", pErr)
+				appLog.ErrorContext(ctx, "Error during rotation process", "err", pErr)
 			}
 		}
 	}
@@ -113,29 +117,30 @@ func (c *CLI) execute(ctx context.Context, _ *kong.Context, out io.Writer) error
 	runCycle()
 
 	if c.Once {
-		logger.InfoContext(ctx, "Completed single run cycle, exiting.")
+		appLog.InfoContext(ctx, "Completed single run cycle, exiting.")
 
 		return nil
 	}
 
-	return c.runDaemon(ctx, cfg.Daemon.Interval, logger, runCycle)
+	return c.runDaemon(ctx, cfg.Daemon.Interval, runCycle)
 }
 
-func (c *CLI) runDaemon(ctx context.Context, interval time.Duration, logger *slog.Logger, runCycle func()) error {
+func (c *CLI) runDaemon(ctx context.Context, interval time.Duration, runCycle func()) error {
+	appLog := logger.FromContext(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	var running sync.Mutex
 	var wg sync.WaitGroup
 
-	logger.InfoContext(ctx, "Entering daemon loop", "interval", interval)
+	appLog.InfoContext(ctx, "Entering daemon loop", "interval", interval)
 
 	for {
 		select {
 		case <-ctx.Done():
-			logger.InfoContext(ctx, "Shutdown signal received, waiting for pending operations...")
+			appLog.InfoContext(ctx, "Shutdown signal received, waiting for pending operations...")
 			wg.Wait()
-			logger.InfoContext(ctx, "Termination complete.")
+			appLog.InfoContext(ctx, "Termination complete.")
 
 			return nil
 		case <-ticker.C:
@@ -145,26 +150,8 @@ func (c *CLI) runDaemon(ctx context.Context, interval time.Duration, logger *slo
 					runCycle()
 				})
 			} else {
-				logger.WarnContext(ctx, "Previous cycle still in progress, skipping this tick")
+				appLog.WarnContext(ctx, "Previous cycle still in progress, skipping this tick")
 			}
 		}
 	}
-}
-
-func setupLogging(levelStr string, out io.Writer) *slog.Logger {
-	var level slog.Level
-	switch levelStr {
-	case "debug":
-		level = slog.LevelDebug
-	case "warn":
-		level = slog.LevelWarn
-	case "error":
-		level = slog.LevelError
-	default:
-		level = slog.LevelInfo
-	}
-
-	return slog.New(slog.NewTextHandler(out, &slog.HandlerOptions{
-		Level: level,
-	}))
 }
