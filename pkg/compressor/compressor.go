@@ -45,6 +45,7 @@ const (
 
 // Compressor compresses files and directories into tar archives.
 type Compressor struct {
+	bufPool  *sync.Pool
 	compType CompressionType
 	level    int
 }
@@ -71,6 +72,13 @@ func NewWithType(compType CompressionType, level int) *Compressor {
 	return &Compressor{
 		compType: compType,
 		level:    level,
+		bufPool: &sync.Pool{
+			New: func() any {
+				buf := make([]byte, copyBufSize)
+
+				return &buf
+			},
+		},
 	}
 }
 
@@ -219,7 +227,7 @@ func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
 		}
 
 		if !d.IsDir() {
-			return copyFileToTar(path, tw)
+			return c.copyFileToTar(path, tw)
 		}
 
 		return nil
@@ -258,7 +266,7 @@ func (c *Compressor) compressZip(sourceDir, targetArchive string) error {
 			return walkErr
 		}
 
-		return zipWalkEntry(zw, sourceDir, path, d)
+		return c.zipWalkEntry(zw, sourceDir, path, d)
 	})
 	if walkErr != nil {
 		return walkErr
@@ -281,7 +289,7 @@ func (c *Compressor) compressZip(sourceDir, targetArchive string) error {
 	return nil
 }
 
-func zipWalkEntry(zw *zip.Writer, sourceDir, path string, d fs.DirEntry) error {
+func (c *Compressor) zipWalkEntry(zw *zip.Writer, sourceDir, path string, d fs.DirEntry) error {
 	relPath, relErr := filepath.Rel(sourceDir, path)
 	if relErr != nil {
 		return fmt.Errorf("rel path calculation: %w", relErr)
@@ -312,7 +320,7 @@ func zipWalkEntry(zw *zip.Writer, sourceDir, path string, d fs.DirEntry) error {
 	}
 
 	if !d.IsDir() {
-		return copyFileToWriter(path, w)
+		return c.copyFileToWriter(path, w)
 	}
 
 	return nil
@@ -320,32 +328,23 @@ func zipWalkEntry(zw *zip.Writer, sourceDir, path string, d fs.DirEntry) error {
 
 const copyBufSize = 64 * 1024
 
-//nolint:gochecknoglobals // buffer pool is reused globally across streaming archives.
-var copyBufPool = sync.Pool{
-	New: func() any {
-		buf := make([]byte, copyBufSize)
-
-		return &buf
-	},
+func (c *Compressor) copyFileToTar(path string, tw *tar.Writer) error {
+	return c.copyFileToWriter(path, tw)
 }
 
-func copyFileToTar(path string, tw *tar.Writer) error {
-	return copyFileToWriter(path, tw)
-}
-
-func copyFileToWriter(path string, w io.Writer) error {
+func (c *Compressor) copyFileToWriter(path string, w io.Writer) error {
 	srcFile, openErr := os.Open(path)
 	if openErr != nil {
 		return fmt.Errorf("opening file %s: %w", path, openErr)
 	}
 	defer srcFile.Close()
 
-	bufPtr, ok := copyBufPool.Get().(*[]byte)
+	bufPtr, ok := c.bufPool.Get().(*[]byte)
 	if !ok {
 		buf := make([]byte, copyBufSize)
 		bufPtr = &buf
 	}
-	defer copyBufPool.Put(bufPtr)
+	defer c.bufPool.Put(bufPtr)
 
 	if _, copyErr := io.CopyBuffer(w, srcFile, *bufPtr); copyErr != nil {
 		return fmt.Errorf("copying file %s into archive: %w", path, copyErr)

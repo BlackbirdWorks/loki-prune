@@ -5,6 +5,7 @@ package disk
 
 import (
 	"fmt"
+	"math"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,10 +20,8 @@ func Usage(path string) (UsageStats, error) {
 	}
 
 	bsize := statBsize(&stat)
-	//nolint:gosec // statfs block counts fit in positive int64 for filesystem stats.
-	total := int64(stat.Blocks) * bsize
-	//nolint:gosec // statfs block counts fit in positive int64 for filesystem stats.
-	free := int64(stat.Bavail) * bsize
+	total := safeBlocksToInt64(stat.Blocks) * bsize
+	free := safeBlocksToInt64(stat.Bavail) * bsize
 	used := total - free
 
 	var pct float64
@@ -36,4 +35,12 @@ func Usage(path string) (UsageStats, error) {
 		UsedBytes:   used,
 		UsedPercent: pct,
 	}, nil
+}
+
+func safeBlocksToInt64(blocks uint64) int64 {
+	if blocks > math.MaxInt64 {
+		return math.MaxInt64
+	}
+
+	return int64(blocks)
 }
