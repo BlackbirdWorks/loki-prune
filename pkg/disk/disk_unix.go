@@ -18,7 +18,7 @@ func Usage(path string) (UsageStats, error) {
 		return UsageStats{}, fmt.Errorf("statfs %s: %w", path, err)
 	}
 
-	bsize := int64(stat.Bsize)
+	bsize := statBsize(&stat)
 	//nolint:gosec // statfs block counts fit in positive int64 for filesystem stats.
 	total := int64(stat.Blocks) * bsize
 	//nolint:gosec // statfs block counts fit in positive int64 for filesystem stats.
