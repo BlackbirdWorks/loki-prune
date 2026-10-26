@@ -12,14 +12,37 @@ loki:
 
 # Daemon / scheduling settings
 daemon:
-  interval: "5m"              # Frequency of evaluation cycles
+  # Operational mode:
+  # - "poll" (default): Stateless interval-based polling. Lowest resource footprint,
+  #   zero inotify handles, ideal for large chunk sets or container environments.
+  # - "fsevent": Real-time in-memory tracking via fsnotify with recursive directory
+  #   watching and automatic event cooldown.
+  mode: "poll"
+
+  # Evaluation frequency for poll mode (and safety heartbeat for fsevent mode)
+  interval: "5m"
+
+  # Cooldown period used in "fsevent" mode. When Loki flushes a burst of chunk writes,
+  # loki-prune waits for I/O to quiet down for this duration before evaluating directory size.
+  cooldown: "5s"
+
+  # Adaptive polling: dynamically reduces sleep duration down to min_interval
+  # as storage approaches or exceeds trigger_size.
+  adaptive: true
+  min_interval: "5s"
+
+  # Logging configuration
   log_level: "info"           # debug, info, warn, error
+  log_type: "text"            # "text" or "json"
 
 # Monitored directory paths
 paths:
   - name: "loki-chunks"
     path: "/share/Data/metrics/loki/chunks"
     archive_dir: "/share/Data/metrics/loki/archive"
+
+    # Emergency disk guard: triggers rotation if parent filesystem usage exceeds percentage
+    disk_guard_percent: 90.0
 
     # Size thresholds (supports B, KB, KiB, MB, MiB, GB, GiB, TB, TiB)
     trigger_size: "48GB"       # Begin rotation when directory exceeds 48 GB

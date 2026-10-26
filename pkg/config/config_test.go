@@ -135,8 +135,68 @@ paths:
 				assert.Equal(t, 2, p.Rotation.Delay.Rotations)
 				assert.Equal(t, 24*time.Hour, p.Rotation.Delay.Age)
 				assert.Equal(t, 10, p.Rotation.MaxRotations)
+				assert.Equal(t, config.ModePoll, cfg.Daemon.Mode)
+				assert.Equal(t, 5*time.Second, cfg.Daemon.Cooldown)
 			},
 			wantErr: nil,
+		},
+		{
+			name: "valid fsevent mode configuration",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := `
+daemon:
+  mode: "fsevent"
+  cooldown: "10s"
+paths:
+  - path: "/tmp/chunks"
+    trigger_size: "10GB"
+`
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: func(t *testing.T, cfg *config.Config) {
+				t.Helper()
+				assert.Equal(t, config.ModeFSEvent, cfg.Daemon.Mode)
+				assert.Equal(t, 10*time.Second, cfg.Daemon.Cooldown)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "invalid daemon mode error",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := "daemon:\n  mode: 'invalid-mode'\npaths:\n  - path: '/tmp/chunks'\n    trigger_size: '10GB'\n"
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: nil,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.ErrorIs(t, err, config.ErrInvalidDaemonMode)
+			},
+		},
+		{
+			name: "invalid daemon cooldown duration error",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := "daemon:\n  cooldown: 'bad-cooldown'\npaths:\n  - path: '/tmp/chunks'\n    trigger_size: '10GB'\n"
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: nil,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.ErrorIs(t, err, config.ErrInvalidDuration)
+			},
 		},
 		{
 			name: "defaults applied",

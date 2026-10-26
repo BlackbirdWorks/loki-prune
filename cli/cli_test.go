@@ -2,12 +2,9 @@ package cli_test
 
 import (
 	"bytes"
-	"context"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,7 +68,7 @@ func TestRun(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid path config causes rotator error",
+			name: "invalid path config causes service error",
 			setup: func(t *testing.T) []string {
 				t.Helper()
 				tempDir := t.TempDir()
@@ -123,185 +120,6 @@ func TestRunCLI(t *testing.T) {
 			var errOut bytes.Buffer
 			err := cli.RunCLI(tc.args, &out, &errOut)
 			require.NoError(t, err)
-		})
-	}
-}
-
-func TestComputeNextInterval(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name        string
-		interval    time.Duration
-		minInterval time.Duration
-		adaptive    bool
-		ratio       float64
-		want        time.Duration
-	}{
-		{
-			name:        "non-adaptive returns base interval",
-			interval:    60 * time.Second,
-			minInterval: 5 * time.Second,
-			adaptive:    false,
-			ratio:       0.9,
-			want:        60 * time.Second,
-		},
-		{
-			name:        "minInterval zero returns base interval",
-			interval:    60 * time.Second,
-			minInterval: 0,
-			adaptive:    true,
-			ratio:       0.9,
-			want:        60 * time.Second,
-		},
-		{
-			name:        "minInterval equal or greater returns base interval",
-			interval:    60 * time.Second,
-			minInterval: 60 * time.Second,
-			adaptive:    true,
-			ratio:       0.9,
-			want:        60 * time.Second,
-		},
-		{
-			name:        "ratio under threshold returns base interval",
-			interval:    60 * time.Second,
-			minInterval: 5 * time.Second,
-			adaptive:    true,
-			ratio:       0.4,
-			want:        60 * time.Second,
-		},
-		{
-			name:        "ratio over one returns min interval",
-			interval:    60 * time.Second,
-			minInterval: 5 * time.Second,
-			adaptive:    true,
-			ratio:       1.2,
-			want:        5 * time.Second,
-		},
-		{
-			name:        "ratio at threshold 0.75 scales midway",
-			interval:    60 * time.Second,
-			minInterval: 10 * time.Second,
-			adaptive:    true,
-			ratio:       0.75,
-			want:        35 * time.Second,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := cli.ComputeNextInterval(tc.interval, tc.minInterval, tc.adaptive, tc.ratio)
-			assert.Equal(t, tc.want, got)
-		})
-	}
-}
-
-func TestCLI_RunDaemon(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		interval time.Duration
-	}{
-		{name: "daemon runs tick and shuts down on context cancel", interval: 10 * time.Millisecond},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			c := &cli.CLI{}
-			ctx, cancel := context.WithCancel(context.Background())
-			var count atomic.Int32
-
-			done := make(chan struct{})
-			go func() {
-				_ = c.RunDaemon(ctx, tc.interval, func() {
-					count.Add(1)
-				})
-				close(done)
-			}()
-
-			assert.Eventually(t, func() bool {
-				return count.Load() >= 1
-			}, 2*time.Second, 10*time.Millisecond)
-
-			cancel()
-			<-done
-		})
-	}
-}
-
-func TestCLI_RunDaemonAdaptive(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		setupEvents  func() chan struct{}
-		name         string
-		interval     time.Duration
-		minInterval  time.Duration
-		initialRatio float64
-		adaptive     bool
-	}{
-		{
-			name:         "adaptive daemon runs and stops on cancel without events",
-			interval:     20 * time.Millisecond,
-			minInterval:  5 * time.Millisecond,
-			initialRatio: 0.9,
-			adaptive:     true,
-			setupEvents:  nil,
-		},
-		{
-			name:         "adaptive daemon reacts to realtime events",
-			interval:     500 * time.Millisecond,
-			minInterval:  5 * time.Millisecond,
-			initialRatio: 0.2,
-			adaptive:     true,
-			setupEvents: func() chan struct{} {
-				ch := make(chan struct{}, 1)
-				ch <- struct{}{}
-
-				return ch
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			c := &cli.CLI{}
-			ctx, cancel := context.WithCancel(context.Background())
-			var count atomic.Int32
-
-			var events chan struct{}
-			if tc.setupEvents != nil {
-				events = tc.setupEvents()
-			}
-
-			done := make(chan struct{})
-			go func() {
-				_ = c.RunDaemonAdaptive(
-					ctx,
-					tc.interval,
-					tc.minInterval,
-					tc.adaptive,
-					tc.initialRatio,
-					events,
-					func() float64 {
-						count.Add(1)
-
-						return 0.95
-					},
-				)
-				close(done)
-			}()
-
-			assert.Eventually(t, func() bool {
-				return count.Load() >= 1
-			}, 2*time.Second, 10*time.Millisecond)
-
-			cancel()
-			<-done
 		})
 	}
 }

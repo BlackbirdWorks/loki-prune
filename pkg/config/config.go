@@ -6,12 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/blackbirdworks/loki-prune/pkg/bytesize"
 )
 
 var (
@@ -26,29 +26,27 @@ var (
 	// ErrUnsupportedCompression is returned for unknown compression types.
 	ErrUnsupportedCompression = errors.New("unsupported compression type")
 	// ErrInvalidSizeFormat is returned when a byte size string cannot be parsed.
-	ErrInvalidSizeFormat = errors.New("invalid size format")
+	ErrInvalidSizeFormat = bytesize.ErrInvalidFormat
 	// ErrUnknownUnit is returned when a byte unit is unrecognized.
-	ErrUnknownUnit = errors.New("unknown unit")
+	ErrUnknownUnit = bytesize.ErrUnknownUnit
 	// ErrInvalidDuration is returned when a time duration cannot be parsed.
 	ErrInvalidDuration = errors.New("invalid duration")
+	// ErrInvalidDaemonMode is returned when daemon mode is neither 'poll' nor 'fsevent'.
+	ErrInvalidDaemonMode = errors.New("invalid daemon mode, must be 'poll' or 'fsevent'")
 )
 
 const (
+	// ModePoll runs evaluation on scheduled intervals without filesystem watchers.
+	ModePoll = "poll"
+	// ModeFSEvent runs evaluation triggered by filesystem events with a cooldown window.
+	ModeFSEvent = "fsevent"
+
+	defaultCooldown         = 5 * time.Second
 	defaultTargetRatio      = 0.8
 	defaultLokiTimeout      = 30 * time.Second
 	defaultInterval         = 5 * time.Minute
 	defaultMinInterval      = 5 * time.Second
 	defaultDiskGuardPercent = 90.0
-	regexExpectedGroups     = 3
-
-	unitKibi = 1024
-	unitKilo = 1000
-	unitMebi = 1024 * 1024
-	unitMega = 1000 * 1000
-	unitGibi = 1024 * 1024 * 1024
-	unitGiga = 1000 * 1000 * 1000
-	unitTebi = 1024 * 1024 * 1024 * 1024
-	unitTera = 1000 * 1000 * 1000 * 1000
 )
 
 // Config represents the top-level loki-prune configuration.
@@ -70,10 +68,13 @@ type LokiConfig struct {
 // DaemonConfig holds service and scheduling options.
 type DaemonConfig struct {
 	AdaptiveRaw    *bool         `yaml:"adaptive"`
+	Mode           string        `yaml:"mode"`     // "poll" (default) or "fsevent"
+	CooldownStr    string        `yaml:"cooldown"` // event cooldown (default "5s")
 	IntervalStr    string        `yaml:"interval"`
 	MinIntervalStr string        `yaml:"min_interval"`
 	LogLevel       string        `yaml:"log_level"`
 	LogType        string        `yaml:"log_type"`
+	Cooldown       time.Duration `yaml:"-"`
 	Interval       time.Duration `yaml:"-"`
 	MinInterval    time.Duration `yaml:"-"`
 	Adaptive       bool          `yaml:"-"`
@@ -171,6 +172,45 @@ func (c *Config) validateLoki() error {
 }
 
 func (c *Config) validateDaemon() error {
+	if err := c.validateDaemonMode(); err != nil {
+		return err
+	}
+
+	if err := c.validateDaemonIntervals(); err != nil {
+		return err
+	}
+
+	c.validateDaemonLogging()
+
+	return nil
+}
+
+func (c *Config) validateDaemonMode() error {
+	mode := strings.ToLower(strings.TrimSpace(c.Daemon.Mode))
+	if mode == "" {
+		mode = ModePoll
+	}
+	if mode != ModePoll && mode != ModeFSEvent {
+		return fmt.Errorf("%w: %q", ErrInvalidDaemonMode, c.Daemon.Mode)
+	}
+	c.Daemon.Mode = mode
+
+	if c.Daemon.CooldownStr == "" {
+		c.Daemon.Cooldown = defaultCooldown
+
+		return nil
+	}
+
+	cd, err := time.ParseDuration(c.Daemon.CooldownStr)
+	if err != nil {
+		return fmt.Errorf("%w: daemon.cooldown: %w", ErrInvalidDuration, err)
+	}
+	c.Daemon.Cooldown = cd
+
+	return nil
+}
+
+func (c *Config) validateDaemonIntervals() error {
 	if c.Daemon.IntervalStr == "" {
 		c.Daemon.Interval = defaultInterval
 	} else {
@@ -197,6 +237,10 @@ func (c *Config) validateDaemon() error {
 		c.Daemon.Adaptive = true
 	}
 
+	return nil
+}
+
+func (c *Config) validateDaemonLogging() {
 	if envLevel := os.Getenv("LOG_LEVEL"); envLevel != "" {
 		c.Daemon.LogLevel = envLevel
 	} else if c.Daemon.LogLevel == "" {
@@ -208,8 +252,6 @@ func (c *Config) validateDaemon() error {
 	} else if c.Daemon.LogType == "" {
 		c.Daemon.LogType = "text"
 	}
-
-	return nil
 }
 
 func (c *Config) validatePath(idx int) error {
@@ -289,63 +331,12 @@ func (c *Config) validateCompression(idx int) error {
 	return nil
 }
 
-var sizeRegex = regexp.MustCompile(`(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)\s*$`)
-
 // ParseBytes converts human-friendly byte strings (e.g. "48GB", "500MB", "10GiB") into raw bytes.
 func ParseBytes(s string) (int64, error) {
-	matches := sizeRegex.FindStringSubmatch(strings.TrimSpace(s))
-	if len(matches) != regexExpectedGroups {
-		return 0, fmt.Errorf("%w: %q", ErrInvalidSizeFormat, s)
-	}
-
-	val, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return 0, fmt.Errorf("%w: %q: %w", ErrInvalidSizeFormat, matches[1], err)
-	}
-
-	mult, err := getMultiplier(strings.ToUpper(matches[2]))
-	if err != nil {
-		return 0, err
-	}
-
-	return int64(val * mult), nil
-}
-
-func getMultiplier(unit string) (float64, error) {
-	switch unit {
-	case "", "B":
-		return 1, nil
-	case "K", "KB":
-		return unitKilo, nil
-	case "KIB":
-		return unitKibi, nil
-	case "M", "MB":
-		return unitMega, nil
-	case "MIB":
-		return unitMebi, nil
-	case "G", "GB":
-		return unitGiga, nil
-	case "GIB":
-		return unitGibi, nil
-	case "T", "TB":
-		return unitTera, nil
-	case "TIB":
-		return unitTebi, nil
-	default:
-		return 0, fmt.Errorf("%w: %q", ErrUnknownUnit, unit)
-	}
+	return bytesize.Parse(s)
 }
 
 // FormatBytes formats raw byte count into human-friendly string (e.g. "48.25 GiB").
-func FormatBytes(bytes int64) string {
-	if bytes < unitKibi {
-		return fmt.Sprintf("%d B", bytes)
-	}
-	div, exp := int64(unitKibi), 0
-	for n := bytes / unitKibi; n >= unitKibi; n /= unitKibi {
-		div *= unitKibi
-		exp++
-	}
-
-	return fmt.Sprintf("%.2f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
+func FormatBytes(b int64) string {
+	return bytesize.Format(b)
 }

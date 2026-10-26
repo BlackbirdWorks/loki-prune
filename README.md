@@ -67,6 +67,19 @@ go install github.com/blackbirdworks/loki-prune/cmd/loki-prune@latest
 
 ---
 
+## Operational Modes
+
+`loki-prune` supports two operational modes depending on your infrastructure and monitoring requirements:
+
+| Mode | Mechanism | Resource Profile | Best For |
+| :--- | :--- | :--- | :--- |
+| **`poll`** *(Default)* | Scheduled timer loop (`interval: 5m`, adaptive down to `min_interval`). Evaluates directory sizes via fast stateless directory walk on tick. | **Minimal**: Zero `inotify` watches, zero open file descriptors for directories, negligible RAM. | Production servers, QNAP/NAS, container hosts with massive chunk directories (10k+ files), or environments with constrained kernel inotify watch limits (`fs.inotify.max_user_watches`). |
+| **`fsevent`** | In-memory file inventory updated in real-time via `fsnotify` with recursive directory watching. | **Low-latency**: Maintains $O(1)$ size tracking and initiates an evaluation after a configurable **cooldown** window (e.g. `5s`) once write activity quiets down. | Near-realtime rotation needs where rapid log spikes must be pruned immediately without waiting for a polling tick. |
+
+Set the mode via YAML config (`daemon.mode: "poll"` or `"fsevent"`) or override via `--mode <poll|fsevent>`.
+
+---
+
 ## Configuration
 
 Example `loki-prune.yaml`:
@@ -81,14 +94,20 @@ loki:
 
 # Daemon settings
 daemon:
-  interval: "5m"              # Evaluation frequency
+  mode: "poll"                # "poll" (default) or "fsevent"
+  interval: "5m"              # Evaluation frequency in poll mode; heartbeat in fsevent mode
+  cooldown: "5s"              # Event cooldown before evaluating (used in fsevent mode)
+  adaptive: true              # Automatically scales sleep interval based on quota pressure
+  min_interval: "5s"          # Minimum sleep interval when quota ratio >= 1.0
   log_level: "info"           # debug, info, warn, error
+  log_type: "text"            # "text" or "json"
 
 # Storage paths to manage
 paths:
   - name: "loki-chunks"
     path: "/data/loki/chunks"
     archive_dir: "/data/loki/archive"
+    disk_guard_percent: 90.0   # Emergency trigger if host disk exceeds 90% full
 
     # Thresholds
     trigger_size: "48GB"       # Begin rotation when directory exceeds 48 GB
@@ -114,8 +133,11 @@ paths:
 ## Usage
 
 ```bash
-# Run as a continuous daemon
+# Run as a continuous daemon (default: poll mode)
 loki-prune --config /path/to/config.yaml
+
+# Run with real-time filesystem event detection (with cooldown)
+loki-prune --config /path/to/config.yaml --mode fsevent
 
 # Run once and exit (ideal for crontab)
 loki-prune --config /path/to/config.yaml --once

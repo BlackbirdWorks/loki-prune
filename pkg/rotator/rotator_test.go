@@ -2,8 +2,6 @@ package rotator_test
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -12,643 +10,152 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/blackbirdworks/loki-prune/pkg/compressor"
 	"github.com/blackbirdworks/loki-prune/pkg/config"
 	"github.com/blackbirdworks/loki-prune/pkg/rotator"
 )
 
-func TestNew(t *testing.T) {
+func TestCalculateDirSize_And_CollectOldestItems(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name    string
-		cType   string
-		wantErr bool
-	}{
-		{name: "valid zstd", cType: "zstd", wantErr: false},
-		{name: "invalid type", cType: "invalid-type", wantErr: true},
-	}
+	tmp := t.TempDir()
+	sourceDir := filepath.Join(tmp, "source")
+	archiveDir := filepath.Join(sourceDir, "archive")
+	require.NoError(t, os.MkdirAll(sourceDir, 0755))
+	require.NoError(t, os.MkdirAll(archiveDir, 0755))
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			pCfg := config.PathConfig{
-				Rotation: config.RotationConfig{Type: tc.cType},
-			}
-			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-			if tc.wantErr {
-				require.Error(t, err)
-				assert.Nil(t, r)
-			} else {
-				require.NoError(t, err)
-				assert.NotNil(t, r)
-			}
-		})
-	}
+	f1 := filepath.Join(sourceDir, "file1.log")
+	f2 := filepath.Join(sourceDir, "file2.log")
+	ignored := filepath.Join(archiveDir, "ignored.log")
+
+	require.NoError(t, os.WriteFile(f1, []byte("hello"), 0600))
+	time.Sleep(10 * time.Millisecond)
+	require.NoError(t, os.WriteFile(f2, []byte("world!"), 0600))
+	require.NoError(t, os.WriteFile(ignored, []byte("should-be-ignored"), 0600))
+
+	sz, count, err := rotator.CalculateDirSize(sourceDir, archiveDir)
+	require.NoError(t, err)
+	assert.Equal(t, int64(11), sz)
+	assert.Equal(t, 2, count)
+
+	items, err := rotator.CollectOldestItems(sourceDir, archiveDir)
+	require.NoError(t, err)
+	require.Len(t, items, 2)
+	assert.Equal(t, f1, items[0].Path)
+	assert.Equal(t, f2, items[1].Path)
 }
 
-func TestRotator_Process(t *testing.T) {
+func TestRotate(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		setup   func(t *testing.T) (*rotator.Rotator, func(t *testing.T))
-		wantErr func(t *testing.T, err error)
-		name    string
-	}{
-		{
-			name: "size below trigger does not rotate",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "chunks")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(watchDir, 0750))
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "chunk-1.bin"), make([]byte, 500), 0600))
+	t.Run("dry run does not move files", func(t *testing.T) {
+		t.Parallel()
+		tmp := t.TempDir()
+		sourceDir := filepath.Join(tmp, "source")
+		archiveDir := filepath.Join(tmp, "archive")
+		require.NoError(t, os.MkdirAll(sourceDir, 0755))
 
-				pCfg := config.PathConfig{
-					Name:             "test",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  800,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
+		f1 := filepath.Join(sourceDir, "test.log")
+		require.NoError(t, os.WriteFile(f1, []byte("data"), 0600))
 
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					assert.Empty(t, entries)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "size above trigger rotates and compresses",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "chunks")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(watchDir, 0750))
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-				for i := 1; i <= 5; i++ {
-					p := filepath.Join(watchDir, "chunk-"+string(rune('0'+i))+".bin")
-					require.NoError(t, os.WriteFile(p, make([]byte, 1024), 0600))
-					time.Sleep(5 * time.Millisecond)
-				}
-
-				pCfg := config.PathConfig{
-					Name:             "test",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 3000,
-					TargetSizeBytes:  2000,
-					Rotation: config.RotationConfig{
-						MaxRotations: 5,
-						Compress:     true,
-						Type:         "zstd",
-						Level:        1,
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					assert.NotEmpty(t, entries)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "dry run does not move files",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "chunks")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(watchDir, 0750))
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-				for i := 1; i <= 4; i++ {
-					p := filepath.Join(watchDir, "chunk-"+string(rune('0'+i))+".bin")
-					require.NoError(t, os.WriteFile(p, make([]byte, 1024), 0600))
-				}
-
-				pCfg := config.PathConfig{
-					Name:             "test",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 2000,
-					TargetSizeBytes:  1000,
-					Rotation: config.RotationConfig{
-						MaxRotations: 5,
-						Compress:     true,
-						Type:         "zstd",
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, true)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					wEntries, readErr := os.ReadDir(watchDir)
-					require.NoError(t, readErr)
-					assert.Len(t, wEntries, 4)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "delayed compression keeps specified newest uncompressed",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-
-				for i := 1; i <= 3; i++ {
-					rotDir := filepath.Join(archiveDir, "rotation-2026-01-0"+string(rune('0'+i)))
-					require.NoError(t, os.MkdirAll(rotDir, 0750))
-					require.NoError(t, os.WriteFile(filepath.Join(rotDir, "data.bin"), []byte("data"), 0600))
-					time.Sleep(10 * time.Millisecond)
-				}
-
-				pCfg := config.PathConfig{
-					Name:             "delayed",
-					Path:             tmp,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 100 * 1024,
-					TargetSizeBytes:  50 * 1024,
-					Rotation: config.RotationConfig{
-						MaxRotations: 10,
-						Compress:     true,
-						Type:         "zstd",
-						Level:        1,
-						Delay: config.DelayConfig{
-							Rotations: 2,
-						},
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					uncompressed := 0
-					compressed := 0
-					for _, e := range entries {
-						if e.IsDir() {
-							uncompressed++
-						} else if filepath.Ext(e.Name()) == ".zst" {
-							compressed++
-						}
-					}
-					assert.Equal(t, 2, uncompressed)
-					assert.Equal(t, 1, compressed)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "enforce max rotations prunes oldest archives",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-
-				for i := 1; i <= 5; i++ {
-					f := filepath.Join(archiveDir, "rotation-2026-01-0"+string(rune('0'+i))+".tar.zst")
-					require.NoError(t, os.WriteFile(f, []byte("archive content"), 0600))
-					time.Sleep(5 * time.Millisecond)
-				}
-
-				pCfg := config.PathConfig{
-					Name:             "retention",
-					Path:             tmp,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 100 * 1024,
-					TargetSizeBytes:  50 * 1024,
-					Rotation: config.RotationConfig{
-						MaxRotations: 3,
-						Compress:     false,
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					assert.Len(t, entries, 3)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "single file rotation empties source file and archives",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				logFile := filepath.Join(tmp, "loki.log")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.WriteFile(logFile, make([]byte, 2048), 0600))
-
-				pCfg := config.PathConfig{
-					Name:             "single-file",
-					Path:             logFile,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  500,
-					Rotation: config.RotationConfig{
-						MaxRotations: 3,
-						Compress:     true,
-						Type:         "zstd",
-						Level:        1,
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					stat, sErr := os.Stat(logFile)
-					require.NoError(t, sErr)
-					assert.Equal(t, int64(0), stat.Size())
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					assert.NotEmpty(t, entries)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "age delay keeps uncompressed and handles loki error",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-
-				rotDir := filepath.Join(archiveDir, "rotation-recent")
-				require.NoError(t, os.MkdirAll(rotDir, 0750))
-				require.NoError(t, os.WriteFile(filepath.Join(rotDir, "data.log"), []byte("data"), 0600))
-
-				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-					w.WriteHeader(http.StatusInternalServerError)
-				}))
-				t.Cleanup(ts.Close)
-
-				pCfg := config.PathConfig{
-					Name:             "age-delayed",
-					Path:             tmp,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1,
-					TargetSizeBytes:  0,
-					Rotation: config.RotationConfig{
-						Compress: true,
-						Type:     "zstd",
-						Level:    1,
-						Delay: config.DelayConfig{
-							Age: 24 * time.Hour,
-						},
-					},
-				}
-				lokiCfg := config.LokiConfig{
-					URL:     ts.URL,
-					Timeout: 1 * time.Second,
-				}
-				r, err := rotator.New(pCfg, lokiCfg, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					var foundDir bool
-					for _, e := range entries {
-						if e.IsDir() && e.Name() == "rotation-recent" {
-							foundDir = true
-						}
-					}
-					assert.True(t, foundDir)
-				}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "non existent path skips cleanly",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				pCfg := config.PathConfig{
-					Name:             "missing",
-					Path:             "/non/existent/path/for/sure",
-					ArchiveDir:       "/tmp/archive",
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  500,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(_ *testing.T) {}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "archive dir is file logs error without failing process",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "watch")
-				require.NoError(t, os.Mkdir(watchDir, 0750))
-				archiveFile := filepath.Join(tmp, "archive_file")
-				require.NoError(t, os.WriteFile(archiveFile, []byte("blocker"), 0600))
-
-				pCfg := config.PathConfig{
-					Name:             "err-archive",
-					Path:             watchDir,
-					ArchiveDir:       archiveFile,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  500,
-					Rotation: config.RotationConfig{
-						MaxRotations: 3,
-						Compress:     true,
-					},
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(_ *testing.T) {}
-			},
-			wantErr: nil,
-		},
-		{
-			name: "rotation directory creation error fails process",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "watch")
-				require.NoError(t, os.Mkdir(watchDir, 0750))
-				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "data.log"), make([]byte, 2000), 0600))
-
-				fileAsDir := filepath.Join(tmp, "blocker")
-				require.NoError(t, os.WriteFile(fileAsDir, []byte("data"), 0600))
-				archiveDir := filepath.Join(fileAsDir, "sub")
-
-				pCfg := config.PathConfig{
-					Name:             "mkdir-fail",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  500,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(_ *testing.T) {}
-			},
-			wantErr: func(t *testing.T, err error) {
-				t.Helper()
-				assert.Error(t, err)
-			},
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			r, verify := tc.setup(t)
-			err := r.Process(context.Background())
-			if tc.wantErr != nil {
-				tc.wantErr(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			verify(t)
+		res, err := rotator.Rotate(context.Background(), rotator.RotateOptions{
+			SourceDir:   sourceDir,
+			ArchiveDir:  archiveDir,
+			BytesToFree: 4,
+			DryRun:      true,
 		})
-	}
+		require.NoError(t, err)
+		assert.Equal(t, 1, res.MovedCount)
+		assert.Equal(t, int64(4), res.MovedBytes)
+
+		// File should still exist in source
+		_, statErr := os.Stat(f1)
+		assert.NoError(t, statErr)
+	})
+
+	t.Run("moves items to archive directory", func(t *testing.T) {
+		t.Parallel()
+		tmp := t.TempDir()
+		sourceDir := filepath.Join(tmp, "source")
+		archiveDir := filepath.Join(tmp, "archive")
+		require.NoError(t, os.MkdirAll(sourceDir, 0755))
+
+		f1 := filepath.Join(sourceDir, "test.log")
+		require.NoError(t, os.WriteFile(f1, []byte("data"), 0600))
+
+		res, err := rotator.Rotate(context.Background(), rotator.RotateOptions{
+			SourceDir:   sourceDir,
+			ArchiveDir:  archiveDir,
+			BytesToFree: 4,
+			DryRun:      false,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 1, res.MovedCount)
+		assert.Equal(t, int64(4), res.MovedBytes)
+
+		// File should no longer exist in source
+		_, statErr := os.Stat(f1)
+		assert.True(t, os.IsNotExist(statErr))
+
+		// Target file exists in rotation directory
+		archivedFile := filepath.Join(res.RotationDir, "test.log")
+		_, archStat := os.Stat(archivedFile)
+		assert.NoError(t, archStat)
+	})
 }
 
-func TestRotator_ProcessWithRatio(t *testing.T) {
+func TestCompress_And_EnforceRetention(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		setup      func(t *testing.T) (*rotator.Rotator, func(t *testing.T))
-		wantErr    func(t *testing.T, err error)
-		checkRatio func(t *testing.T, ratio float64)
-		name       string
-	}{
-		{
-			name: "returns correct quota ratio when below trigger",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "chunks")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(watchDir, 0750))
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "chunk.bin"), make([]byte, 500), 0600))
+	tmp := t.TempDir()
+	archiveDir := filepath.Join(tmp, "archive")
+	require.NoError(t, os.MkdirAll(archiveDir, 0755))
 
-				pCfg := config.PathConfig{
-					Name:             "ratio-test",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  800,
-					DiskGuardPercent: 99.9,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
+	rot1 := filepath.Join(archiveDir, "rotation-2026-01-01-000001")
+	rot2 := filepath.Join(archiveDir, "rotation-2026-01-01-000002")
+	require.NoError(t, os.MkdirAll(rot1, 0755))
+	require.NoError(t, os.MkdirAll(rot2, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(rot1, "data.log"), []byte("sample1"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(rot2, "data.log"), []byte("sample2"), 0600))
 
-				return r, func(_ *testing.T) {}
-			},
-			checkRatio: func(t *testing.T, ratio float64) {
-				t.Helper()
-				assert.InDelta(t, 0.5, ratio, 0.5)
-			},
-			wantErr: nil,
-		},
-		{
-			name: "single file fast path computes ratio and rotates when above trigger",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				logFile := filepath.Join(tmp, "app.log")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.WriteFile(logFile, make([]byte, 2000), 0600))
+	past := time.Now().Add(-10 * time.Minute)
+	now := time.Now()
+	require.NoError(t, os.Chtimes(rot1, past, past))
+	require.NoError(t, os.Chtimes(rot2, now, now))
 
-				pCfg := config.PathConfig{
-					Name:             "single-file",
-					Path:             logFile,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 1000,
-					TargetSizeBytes:  500,
-					DiskGuardPercent: 99.9,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
+	comp, err := compressor.New("zstd", 1)
+	require.NoError(t, err)
 
-				return r, func(t *testing.T) {
-					t.Helper()
-					st, statErr := os.Stat(logFile)
-					require.NoError(t, statErr)
-					assert.Equal(t, int64(0), st.Size())
-				}
-			},
-			checkRatio: func(t *testing.T, ratio float64) {
-				t.Helper()
-				assert.GreaterOrEqual(t, ratio, 2.0)
-			},
-			wantErr: nil,
-		},
-		{
-			name: "disk guard threshold at 0 triggers emergency rotation",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				tmp := t.TempDir()
-				watchDir := filepath.Join(tmp, "chunks")
-				archiveDir := filepath.Join(tmp, "archive")
-				require.NoError(t, os.MkdirAll(watchDir, 0750))
-				require.NoError(t, os.MkdirAll(archiveDir, 0750))
-				require.NoError(t, os.WriteFile(filepath.Join(watchDir, "chunk.bin"), make([]byte, 500), 0600))
-
-				pCfg := config.PathConfig{
-					Name:             "guard-test",
-					Path:             watchDir,
-					ArchiveDir:       archiveDir,
-					TriggerSizeBytes: 10000,
-					TargetSizeBytes:  5000,
-					DiskGuardPercent: 0.001,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(t *testing.T) {
-					t.Helper()
-					entries, readErr := os.ReadDir(archiveDir)
-					require.NoError(t, readErr)
-					assert.NotEmpty(t, entries)
-				}
-			},
-			checkRatio: func(t *testing.T, ratio float64) {
-				t.Helper()
-				assert.Greater(t, ratio, 0.0)
-			},
-			wantErr: nil,
-		},
-		{
-			name: "missing path returns zero ratio and nil error",
-			setup: func(t *testing.T) (*rotator.Rotator, func(t *testing.T)) {
-				t.Helper()
-				pCfg := config.PathConfig{
-					Name:             "missing-path",
-					Path:             "/non/existent/path/for/test",
-					TriggerSizeBytes: 1000,
-				}
-				r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-				require.NoError(t, err)
-
-				return r, func(_ *testing.T) {}
-			},
-			checkRatio: func(t *testing.T, ratio float64) {
-				t.Helper()
-				assert.InDelta(t, 0.0, ratio, 0.001)
-			},
-			wantErr: nil,
+	rotCfg := config.RotationConfig{
+		Type:  "zstd",
+		Level: 1,
+		Delay: config.DelayConfig{
+			Rotations: 1, // Keep newest 1 uncompressed
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			r, verify := tc.setup(t)
-			ratio, err := r.ProcessWithRatio(context.Background())
-			if tc.wantErr != nil {
-				tc.wantErr(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			if tc.checkRatio != nil {
-				tc.checkRatio(t, ratio)
-			}
-			verify(t)
-		})
-	}
-}
+	err = rotator.Compress(context.Background(), archiveDir, rotCfg, comp, false)
+	require.NoError(t, err)
 
-func TestRotator_Tracker(t *testing.T) {
-	t.Parallel()
+	// rot1 should be compressed to .tar.zst and raw dir deleted
+	_, statRot1Raw := os.Stat(rot1)
+	assert.True(t, os.IsNotExist(statRot1Raw))
+	_, statRot1Comp := os.Stat(rot1 + ".tar.zst")
+	require.NoError(t, statRot1Comp)
 
-	tests := []struct {
-		name string
-	}{
-		{name: "tracker returns non-nil on valid rotator"},
-	}
+	// rot2 should remain uncompressed due to Rotations: 1 delay
+	_, statRot2Raw := os.Stat(rot2)
+	require.NoError(t, statRot2Raw)
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			tmp := t.TempDir()
-			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
-			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-			require.NoError(t, err)
-			defer r.Close()
+	// Now test retention: keep only 1 rotation
+	err = rotator.EnforceRetention(context.Background(), archiveDir, 1, false)
+	require.NoError(t, err)
 
-			assert.NotNil(t, r.Tracker())
-		})
-	}
-}
+	// Oldest rotation (.tar.zst) should be pruned
+	_, statRot1After := os.Stat(rot1 + ".tar.zst")
+	assert.True(t, os.IsNotExist(statRot1After))
 
-func TestRotator_StartTracker(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-	}{
-		{name: "start tracker can be canceled cleanly"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			tmp := t.TempDir()
-			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
-			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-			require.NoError(t, err)
-			defer r.Close()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			r.StartTracker(ctx)
-			cancel()
-		})
-	}
-}
-
-func TestRotator_Close(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name string
-	}{
-		{name: "close succeeds on valid rotator"},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			tmp := t.TempDir()
-			pCfg := config.PathConfig{Path: tmp, ArchiveDir: filepath.Join(tmp, "archive")}
-			r, err := rotator.New(pCfg, config.LokiConfig{}, false)
-			require.NoError(t, err)
-
-			assert.NoError(t, r.Close())
-		})
-	}
+	// Newer rotation should still exist
+	_, statRot2After := os.Stat(rot2)
+	assert.NoError(t, statRot2After)
 }

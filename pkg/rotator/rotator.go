@@ -1,4 +1,5 @@
-// Package rotator manages file evaluation, rotation, delayed compression, and retention enforcement.
+// Package rotator provides stateless functions for directory size calculation,
+// file rotation staging, cross-device file moves, delayed compression, and retention enforcement.
 package rotator
 
 import (
@@ -6,231 +7,111 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/blackbirdworks/loki-prune/pkg/compressor"
 	"github.com/blackbirdworks/loki-prune/pkg/config"
-	"github.com/blackbirdworks/loki-prune/pkg/disk"
 	"github.com/blackbirdworks/loki-prune/pkg/logger"
-	"github.com/blackbirdworks/loki-prune/pkg/loki"
-	"github.com/blackbirdworks/loki-prune/pkg/tracker"
 )
 
 const (
-	dirPerm       = 0750
-	filePerm      = 0600
-	percentFactor = 100.0
+	dirPerm              = 0750
+	filePerm             = 0600
+	defaultBatchCapacity = 128
 )
 
-// Rotator manages the monitoring, rotation, compression, and pruning for a path.
-type Rotator struct {
-	tracker    *tracker.Tracker
-	lokiClient *loki.Client
-	compressor *compressor.Compressor
-	cfg        config.PathConfig
-	dryRun     bool
+// FileItem represents a candidate file for rotation.
+type FileItem struct {
+	ModTime time.Time
+	Path    string
+	Size    int64
 }
 
-// New creates a new Rotator instance for a path configuration.
-func New(pCfg config.PathConfig, lokiCfg config.LokiConfig, dryRun bool) (*Rotator, error) {
-	if pCfg.DiskGuardPercent <= 0 {
-		pCfg.DiskGuardPercent = 90.0
-	}
-
-	comp, err := compressor.New(pCfg.Rotation.Type, pCfg.Rotation.Level)
-	if err != nil {
-		return nil, fmt.Errorf("initializing compressor for %s: %w", pCfg.Name, err)
-	}
-
-	trk, trkErr := tracker.New(pCfg.Path, pCfg.ArchiveDir)
-	if trkErr != nil {
-		return nil, fmt.Errorf("initializing tracker for %s: %w", pCfg.Name, trkErr)
-	}
-	_, _, _ = trk.Sync()
-
-	return &Rotator{
-		cfg:        pCfg,
-		lokiClient: loki.NewClient(lokiCfg.URL, lokiCfg.Timeout),
-		compressor: comp,
-		tracker:    trk,
-		dryRun:     dryRun,
-	}, nil
+// RotateOptions controls the execution of a file rotation batch.
+type RotateOptions struct {
+	SourceDir   string
+	ArchiveDir  string
+	Items       []FileItem
+	BytesToFree int64
+	DryRun      bool
 }
 
-// Tracker returns the underlying in-memory file tracker.
-func (r *Rotator) Tracker() *tracker.Tracker {
-	return r.tracker
+// RotateResult contains metadata about the performed rotation batch.
+type RotateResult struct {
+	RotationDir string
+	MovedItems  []FileItem
+	MovedBytes  int64
+	MovedCount  int
 }
 
-// StartTracker starts the real-time filesystem event listener on the tracker.
-func (r *Rotator) StartTracker(ctx context.Context) {
-	if r.tracker != nil {
-		r.tracker.Start(ctx)
-	}
-}
-
-// Close releases resources held by the rotator, including the file tracker.
-func (r *Rotator) Close() error {
-	if r.tracker != nil {
-		return r.tracker.Close()
-	}
-
-	return nil
-}
-
-// Process runs a single evaluation and rotation cycle.
-func (r *Rotator) Process(ctx context.Context) error {
-	_, err := r.ProcessWithRatio(ctx)
-
-	return err
-}
-
-// ProcessWithRatio runs an evaluation cycle and returns the quota/disk pressure ratio (0.0 to >=1.0).
-func (r *Rotator) ProcessWithRatio(ctx context.Context) (float64, error) {
+// Rotate executes a single rotation cycle, moving items up to bytesToFree into a timestamped archive directory.
+func Rotate(ctx context.Context, opts RotateOptions) (RotateResult, error) {
+	var result RotateResult
 	log := logger.FromContext(ctx)
-	log.InfoContext(ctx, "Evaluating path", "name", r.cfg.Name, "path", r.cfg.Path)
 
-	if _, err := os.Stat(r.cfg.Path); os.IsNotExist(err) {
-		log.WarnContext(ctx, "Path does not exist, skipping", "path", r.cfg.Path)
-
-		return 0, nil
-	}
-
-	currentSize, fileCount, err := r.calculateDirSize(r.cfg.Path)
-	if err != nil {
-		return 0, fmt.Errorf("calculating directory size for %s: %w", r.cfg.Path, err)
-	}
-
-	log.InfoContext(ctx, "Path size status",
-		"name", r.cfg.Name,
-		"current", config.FormatBytes(currentSize),
-		"trigger", config.FormatBytes(r.cfg.TriggerSizeBytes),
-		"files", fileCount,
-	)
-
-	var ratio float64
-	if r.cfg.TriggerSizeBytes > 0 {
-		ratio = float64(currentSize) / float64(r.cfg.TriggerSizeBytes)
-	}
-
-	rotated := false
-	if currentSize > r.cfg.TriggerSizeBytes {
-		log.WarnContext(ctx, "Path size exceeded trigger limit, beginning rotation",
-			"name", r.cfg.Name,
-			"current", config.FormatBytes(currentSize),
-			"trigger", config.FormatBytes(r.cfg.TriggerSizeBytes),
-		)
-
-		if rotErr := r.executeRotation(ctx, currentSize); rotErr != nil {
-			return ratio, fmt.Errorf("executing rotation on %s: %w", r.cfg.Name, rotErr)
-		}
-		rotated = true
-	}
-
-	if usage, dErr := disk.Usage(r.cfg.Path); dErr == nil {
-		diskRatio := usage.UsedPercent / percentFactor
-		ratio = math.Max(ratio, diskRatio)
-		if usage.UsedPercent >= r.cfg.DiskGuardPercent && !rotated {
-			log.WarnContext(ctx, "Disk guard threshold exceeded, triggering emergency rotation",
-				"name", r.cfg.Name,
-				"used_percent", fmt.Sprintf("%.2f%%", usage.UsedPercent),
-				"guard_threshold", fmt.Sprintf("%.2f%%", r.cfg.DiskGuardPercent),
-			)
-			if rotErr := r.executeRotation(ctx, currentSize); rotErr != nil {
-				return ratio, fmt.Errorf("executing emergency disk guard rotation on %s: %w", r.cfg.Name, rotErr)
-			}
+	items := opts.Items
+	if len(items) == 0 {
+		var err error
+		items, err = CollectOldestItems(opts.SourceDir, opts.ArchiveDir)
+		if err != nil {
+			return result, fmt.Errorf("collecting items to rotate: %w", err)
 		}
 	}
 
-	if r.cfg.Rotation.Compress {
-		if compErr := r.processCompression(ctx); compErr != nil {
-			log.ErrorContext(ctx, "Error during compression cycle", "name", r.cfg.Name, "err", compErr)
-		}
-	}
-
-	if r.cfg.Rotation.MaxRotations > 0 {
-		if pruneErr := r.enforceMaxRotations(ctx); pruneErr != nil {
-			log.ErrorContext(ctx, "Error enforcing max rotations", "name", r.cfg.Name, "err", pruneErr)
-		}
-	}
-
-	return ratio, nil
-}
-
-type fileEntry struct {
-	modTime time.Time
-	path    string
-	size    int64
-}
-
-func (r *Rotator) executeRotation(ctx context.Context, currentSize int64) error {
-	r.flushLokiBefore(ctx)
-
-	items, err := r.collectOldestItems(r.cfg.Path)
-	if err != nil {
-		return fmt.Errorf("collecting oldest items: %w", err)
-	}
-
-	bytesToFree := currentSize - r.cfg.TargetSizeBytes
 	timestamp := time.Now().UTC().Format("2006-01-02-150405")
 	rotationDirName := fmt.Sprintf("rotation-%s", timestamp)
-	rotationDirPath := filepath.Join(r.cfg.ArchiveDir, rotationDirName)
+	rotationDirPath := filepath.Join(opts.ArchiveDir, rotationDirName)
+	result.RotationDir = rotationDirPath
 
-	if !r.dryRun {
+	if !opts.DryRun {
 		if mkErr := os.MkdirAll(rotationDirPath, dirPerm); mkErr != nil {
-			return fmt.Errorf("creating rotation directory %s: %w", rotationDirPath, mkErr)
+			return result, fmt.Errorf("creating rotation directory %s: %w", rotationDirPath, mkErr)
 		}
 	}
 
-	movedBytes, movedCount := r.moveBatch(ctx, items, bytesToFree, rotationDirPath)
+	for _, item := range items {
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
 
-	log := logger.FromContext(ctx)
+		if result.MovedBytes >= opts.BytesToFree {
+			break
+		}
+
+		if !opts.DryRun {
+			if err := moveSingleItem(item, opts.SourceDir, rotationDirPath); err != nil {
+				log.WarnContext(ctx, "Failed to move item, skipping", "path", item.Path, "err", err)
+
+				continue
+			}
+		}
+
+		result.MovedBytes += item.Size
+		result.MovedCount++
+		result.MovedItems = append(result.MovedItems, item)
+	}
+
 	log.InfoContext(ctx, "Rotation batch staged",
 		"directory", rotationDirPath,
-		"items_moved", movedCount,
-		"freed_bytes", config.FormatBytes(movedBytes),
-		"dry_run", r.dryRun,
+		"items_moved", result.MovedCount,
+		"freed_bytes", config.FormatBytes(result.MovedBytes),
+		"dry_run", opts.DryRun,
 	)
 
-	r.syncLokiAfter(ctx)
-
-	return nil
+	return result, nil
 }
 
-func (r *Rotator) flushLokiBefore(ctx context.Context) {
-	log := logger.FromContext(ctx)
-	log.InfoContext(ctx, "Flushing Loki before rotating")
-	if !r.dryRun {
-		if err := r.lokiClient.Flush(ctx); err != nil {
-			log.WarnContext(ctx, "Loki flush failed (proceeding with caution)", "err", err)
-		} else {
-			log.InfoContext(ctx, "Loki flush completed successfully")
-		}
-	}
-}
-
-func (r *Rotator) syncLokiAfter(ctx context.Context) {
-	log := logger.FromContext(ctx)
-	log.InfoContext(ctx, "Synchronizing Loki after rotation")
-	if !r.dryRun {
-		if err := r.lokiClient.Reload(ctx); err != nil {
-			log.WarnContext(ctx, "Loki reload after rotation returned error", "err", err)
-		}
-	}
-}
-
-func (r *Rotator) moveSingleItem(item fileEntry, targetDir string) error {
-	relPath, relErr := filepath.Rel(r.cfg.Path, item.path)
+func moveSingleItem(item FileItem, sourceRoot, targetDir string) error {
+	relPath, relErr := filepath.Rel(sourceRoot, item.Path)
 	if relErr != nil {
 		return relErr
 	}
 	if relPath == "." {
-		relPath = filepath.Base(item.path)
+		relPath = filepath.Base(item.Path)
 	}
 	destPath := filepath.Join(targetDir, relPath)
 
@@ -238,30 +119,23 @@ func (r *Rotator) moveSingleItem(item fileEntry, targetDir string) error {
 		return fmt.Errorf("creating dest dir %s: %w", filepath.Dir(destPath), mkErr)
 	}
 
-	if renErr := os.Rename(item.path, destPath); renErr != nil {
-		if copyErr := r.moveFileFallback(item.path, destPath); copyErr != nil {
-			return fmt.Errorf("moving %s to %s: %w", item.path, destPath, copyErr)
+	if renErr := os.Rename(item.Path, destPath); renErr != nil {
+		if copyErr := moveFileFallback(item.Path, destPath); copyErr != nil {
+			return fmt.Errorf("moving %s to %s: %w", item.Path, destPath, copyErr)
 		}
 	}
 
-	if r.tracker != nil {
-		r.tracker.Remove(item.path)
-	}
-
-	if item.path == r.cfg.Path {
-		emptyFile, createErr := os.OpenFile(r.cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
+	if item.Path == sourceRoot {
+		emptyFile, createErr := os.OpenFile(sourceRoot, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
 		if createErr == nil {
 			_ = emptyFile.Close()
-		}
-		if r.tracker != nil {
-			_, _, _ = r.tracker.Sync()
 		}
 	}
 
 	return nil
 }
 
-func (r *Rotator) moveFileFallback(src, dst string) error {
+func moveFileFallback(src, dst string) (err error) {
 	in, openErr := os.Open(src)
 	if openErr != nil {
 		return fmt.Errorf("opening source file for cross-device copy: %w", openErr)
@@ -272,7 +146,12 @@ func (r *Rotator) moveFileFallback(src, dst string) error {
 	if createErr != nil {
 		return fmt.Errorf("creating destination file for cross-device copy: %w", createErr)
 	}
-	defer out.Close()
+	defer func() {
+		_ = out.Close()
+		if err != nil {
+			_ = os.Remove(dst)
+		}
+	}()
 
 	if _, copyErr := io.Copy(out, in); copyErr != nil {
 		return fmt.Errorf("copying across devices: %w", copyErr)
@@ -288,74 +167,57 @@ func (r *Rotator) moveFileFallback(src, dst string) error {
 	return os.Remove(src)
 }
 
-func (r *Rotator) moveBatch(
+// Compress evaluates uncompressed rotation batches in archiveDir and compresses eligible batches.
+func Compress(
 	ctx context.Context,
-	items []fileEntry,
-	bytesToFree int64,
-	targetDir string,
-) (int64, int) {
-	log := logger.FromContext(ctx)
-	var movedBytes int64
-	var movedCount int
-
-	for _, item := range items {
-		if movedBytes >= bytesToFree {
-			break
-		}
-
-		if !r.dryRun {
-			if err := r.moveSingleItem(item, targetDir); err != nil {
-				log.WarnContext(ctx, "Failed to move item, skipping", "err", err)
-
-				continue
-			}
-		}
-
-		movedBytes += item.size
-		movedCount++
-	}
-
-	return movedBytes, movedCount
-}
-
-func (r *Rotator) processCompression(ctx context.Context) error {
-	if _, err := os.Stat(r.cfg.ArchiveDir); os.IsNotExist(err) {
+	archiveDir string,
+	rotCfg config.RotationConfig,
+	comp *compressor.Compressor,
+	dryRun bool,
+) error {
+	if _, err := os.Stat(archiveDir); os.IsNotExist(err) {
 		return nil
 	}
 
-	entries, err := os.ReadDir(r.cfg.ArchiveDir)
+	entries, err := os.ReadDir(archiveDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading archive directory %s: %w", archiveDir, err)
 	}
 
 	log := logger.FromContext(ctx)
-	uncompressed := r.getUncompressedRotations(entries)
+	uncompressed := getUncompressedRotations(entries)
 	now := time.Now()
 
 	for idx, dirInfo := range uncompressed {
-		if r.shouldDelayCompression(idx, dirInfo.ModTime(), now) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if shouldDelayCompression(idx, dirInfo.ModTime(), now, rotCfg.Delay) {
 			continue
 		}
 
-		srcDir := filepath.Join(r.cfg.ArchiveDir, dirInfo.Name())
-		archiveFile := srcDir + r.compressor.Extension()
+		srcDir := filepath.Join(archiveDir, dirInfo.Name())
+		archiveFile := srcDir + comp.Extension()
 
 		log.InfoContext(ctx, "Compressing rotation archive",
 			"source", srcDir,
 			"target", archiveFile,
-			"type", r.cfg.Rotation.Type,
-			"level", r.cfg.Rotation.Level,
+			"type", rotCfg.Type,
+			"level", rotCfg.Level,
 		)
 
-		if r.dryRun {
+		if dryRun {
 			continue
 		}
 
-		if compErr := r.compressor.CompressDirectory(srcDir, archiveFile); compErr != nil {
+		if compErr := comp.CompressDirectory(srcDir, archiveFile); compErr != nil {
 			log.ErrorContext(ctx, "Failed to compress rotation", "dir", srcDir, "err", compErr)
 
 			continue
 		}
+
+		_ = os.Chtimes(archiveFile, dirInfo.ModTime(), dirInfo.ModTime())
 
 		if rmErr := os.RemoveAll(srcDir); rmErr != nil {
 			log.WarnContext(ctx, "Failed to remove raw directory after compression", "dir", srcDir, "err", rmErr)
@@ -367,7 +229,7 @@ func (r *Rotator) processCompression(ctx context.Context) error {
 	return nil
 }
 
-func (r *Rotator) getUncompressedRotations(entries []os.DirEntry) []os.FileInfo {
+func getUncompressedRotations(entries []os.DirEntry) []os.FileInfo {
 	var uncompressed []os.FileInfo
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "rotation-") {
@@ -380,57 +242,59 @@ func (r *Rotator) getUncompressedRotations(entries []os.DirEntry) []os.FileInfo 
 		uncompressed = append(uncompressed, info)
 	}
 
-	sort.Slice(uncompressed, func(i, j int) bool {
-		return uncompressed[i].ModTime().After(uncompressed[j].ModTime())
+	slices.SortFunc(uncompressed, func(a, b os.FileInfo) int {
+		return b.ModTime().Compare(a.ModTime())
 	})
 
 	return uncompressed
 }
 
-func (r *Rotator) shouldDelayCompression(rank int, modTime, now time.Time) bool {
-	delayCount := r.cfg.Rotation.Delay.Rotations
-	if delayCount > 0 && rank < delayCount {
+func shouldDelayCompression(rank int, modTime, now time.Time, delay config.DelayConfig) bool {
+	if delay.Rotations > 0 && rank < delay.Rotations {
 		return true
 	}
 
-	delayAge := r.cfg.Rotation.Delay.Age
-	if delayAge > 0 && now.Sub(modTime) < delayAge {
+	if delay.Age > 0 && now.Sub(modTime) < delay.Age {
 		return true
 	}
 
 	return false
 }
 
-func (r *Rotator) enforceMaxRotations(ctx context.Context) error {
-	limit := r.cfg.Rotation.MaxRotations
-	if limit <= 0 {
+// EnforceRetention cleans up expired rotation archives exceeding maxRotations.
+func EnforceRetention(ctx context.Context, archiveDir string, maxRotations int, dryRun bool) error {
+	if maxRotations <= 0 {
 		return nil
 	}
 
-	if _, err := os.Stat(r.cfg.ArchiveDir); os.IsNotExist(err) {
+	if _, err := os.Stat(archiveDir); os.IsNotExist(err) {
 		return nil
 	}
 
-	entries, err := os.ReadDir(r.cfg.ArchiveDir)
+	entries, err := os.ReadDir(archiveDir)
 	if err != nil {
-		return err
+		return fmt.Errorf("reading archive directory %s: %w", archiveDir, err)
 	}
 
-	allRotations := r.collectAllRotations(entries)
-	if len(allRotations) <= limit {
+	allRotations := collectAllRotations(archiveDir, entries)
+	if len(allRotations) <= maxRotations {
 		return nil
 	}
 
-	sort.Slice(allRotations, func(i, j int) bool {
-		return allRotations[i].modTime.Before(allRotations[j].modTime)
+	slices.SortFunc(allRotations, func(a, b rotationItem) int {
+		return a.modTime.Compare(b.modTime)
 	})
 
 	log := logger.FromContext(ctx)
-	toDelete := len(allRotations) - limit
+	toDelete := len(allRotations) - maxRotations
 	for idx := range toDelete {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		target := allRotations[idx].path
-		log.InfoContext(ctx, "Pruning expired rotation", "target", target, "limit", limit)
-		if !r.dryRun {
+		log.InfoContext(ctx, "Pruning expired rotation", "target", target, "limit", maxRotations)
+		if !dryRun {
 			if rmErr := os.RemoveAll(target); rmErr != nil {
 				log.ErrorContext(ctx, "Failed to remove expired rotation", "target", target, "err", rmErr)
 			}
@@ -445,7 +309,7 @@ type rotationItem struct {
 	path    string
 }
 
-func (r *Rotator) collectAllRotations(entries []os.DirEntry) []rotationItem {
+func collectAllRotations(archiveDir string, entries []os.DirEntry) []rotationItem {
 	var items []rotationItem
 	for _, entry := range entries {
 		name := entry.Name()
@@ -457,7 +321,7 @@ func (r *Rotator) collectAllRotations(entries []os.DirEntry) []rotationItem {
 			continue
 		}
 		items = append(items, rotationItem{
-			path:    filepath.Join(r.cfg.ArchiveDir, name),
+			path:    filepath.Join(archiveDir, name),
 			modTime: info.ModTime(),
 		})
 	}
@@ -465,16 +329,8 @@ func (r *Rotator) collectAllRotations(entries []os.DirEntry) []rotationItem {
 	return items
 }
 
-func (r *Rotator) calculateDirSize(dir string) (int64, int, error) {
-	if r.tracker != nil && filepath.Clean(dir) == filepath.Clean(r.cfg.Path) {
-		sz, count := r.tracker.Size()
-		if count > 0 || sz > 0 {
-			return sz, count, nil
-		}
-
-		return r.tracker.Sync()
-	}
-
+// CalculateDirSize walks dir recursively and returns the total byte size and file count, skipping ignoreDir.
+func CalculateDirSize(dir, ignoreDir string) (int64, int, error) {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return 0, 0, fmt.Errorf("stat path %s: %w", dir, err)
@@ -485,19 +341,19 @@ func (r *Rotator) calculateDirSize(dir string) (int64, int, error) {
 
 	var totalSize int64
 	var fileCount int
+	cleanIgnore := filepath.Clean(ignoreDir)
+	cleanIgnorePrefix := cleanIgnore + string(filepath.Separator)
 
-	cleanArchive := filepath.Clean(r.cfg.ArchiveDir)
-
-	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, wErr error) error {
+		if wErr != nil {
+			return wErr
 		}
 
-		if d.IsDir() && filepath.Clean(path) == cleanArchive {
-			return filepath.SkipDir
-		}
-
-		if !d.IsDir() {
+		if d.IsDir() {
+			if path == cleanIgnore || strings.HasPrefix(path, cleanIgnorePrefix) {
+				return filepath.SkipDir
+			}
+		} else {
 			info, statErr := d.Info()
 			if statErr != nil {
 				return statErr
@@ -512,56 +368,42 @@ func (r *Rotator) calculateDirSize(dir string) (int64, int, error) {
 	return totalSize, fileCount, walkErr
 }
 
-func (r *Rotator) collectOldestItems(dir string) ([]fileEntry, error) {
-	if r.tracker != nil && filepath.Clean(dir) == filepath.Clean(r.cfg.Path) {
-		cached := r.tracker.OldestItems()
-		if len(cached) > 0 {
-			entries := make([]fileEntry, len(cached))
-			for i, e := range cached {
-				entries[i] = fileEntry{
-					path:    e.Path,
-					size:    e.Size,
-					modTime: e.ModTime,
-				}
-			}
-
-			return entries, nil
-		}
-	}
-
+// CollectOldestItems walks dir recursively and returns all files sorted oldest to newest by ModTime.
+func CollectOldestItems(dir, ignoreDir string) ([]FileItem, error) {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return nil, fmt.Errorf("stat path %s: %w", dir, err)
 	}
 	if !st.IsDir() {
-		return []fileEntry{{
-			path:    dir,
-			size:    st.Size(),
-			modTime: st.ModTime(),
+		return []FileItem{{
+			Path:    dir,
+			Size:    st.Size(),
+			ModTime: st.ModTime(),
 		}}, nil
 	}
 
-	var entries []fileEntry
-	cleanArchive := filepath.Clean(r.cfg.ArchiveDir)
+	cleanIgnore := filepath.Clean(ignoreDir)
+	cleanIgnorePrefix := cleanIgnore + string(filepath.Separator)
+	entries := make([]FileItem, 0, defaultBatchCapacity)
 
-	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, wErr error) error {
+		if wErr != nil {
+			return wErr
 		}
 
-		if d.IsDir() && filepath.Clean(path) == cleanArchive {
-			return filepath.SkipDir
-		}
-
-		if !d.IsDir() {
+		if d.IsDir() {
+			if path == cleanIgnore || strings.HasPrefix(path, cleanIgnorePrefix) {
+				return filepath.SkipDir
+			}
+		} else {
 			info, statErr := d.Info()
 			if statErr != nil {
 				return statErr
 			}
-			entries = append(entries, fileEntry{
-				path:    path,
-				size:    info.Size(),
-				modTime: info.ModTime(),
+			entries = append(entries, FileItem{
+				Path:    path,
+				Size:    info.Size(),
+				ModTime: info.ModTime(),
 			})
 		}
 
@@ -572,8 +414,8 @@ func (r *Rotator) collectOldestItems(dir string) ([]fileEntry, error) {
 		return nil, walkErr
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].modTime.Before(entries[j].modTime)
+	slices.SortFunc(entries, func(a, b FileItem) int {
+		return a.ModTime.Compare(b.ModTime)
 	})
 
 	return entries, nil
