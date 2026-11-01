@@ -37,6 +37,7 @@ type RotateOptions struct {
 	ArchiveDir  string
 	Items       []FileItem
 	BytesToFree int64
+	SizeHint    int
 	DryRun      bool
 }
 
@@ -51,20 +52,23 @@ type RotateResult struct {
 // Rotate executes a single rotation cycle, moving items up to bytesToFree into a timestamped archive directory.
 func Rotate(ctx context.Context, opts RotateOptions) (RotateResult, error) {
 	var result RotateResult
-	log := logger.FromContext(ctx)
+	if opts.BytesToFree <= 0 {
+		return result, nil
+	}
 
 	items := opts.Items
 	if len(items) == 0 {
 		var err error
-		items, err = CollectOldestItems(opts.SourceDir, opts.ArchiveDir)
+		items, err = collectOldestItems(opts.SourceDir, opts.ArchiveDir, opts.SizeHint)
 		if err != nil {
 			return result, fmt.Errorf("collecting items to rotate: %w", err)
 		}
+		if len(items) == 0 {
+			return result, nil
+		}
 	}
 
-	timestamp := time.Now().UTC().Format("2006-01-02-150405")
-	rotationDirName := fmt.Sprintf("rotation-%s", timestamp)
-	rotationDirPath := filepath.Join(opts.ArchiveDir, rotationDirName)
+	rotationDirPath := uniqueRotationDirPath(opts.ArchiveDir)
 	result.RotationDir = rotationDirPath
 
 	if !opts.DryRun {
@@ -73,9 +77,35 @@ func Rotate(ctx context.Context, opts RotateOptions) (RotateResult, error) {
 		}
 	}
 
+	err := stageRotationItems(ctx, opts, items, &result)
+	if !opts.DryRun && result.MovedCount == 0 {
+		_ = os.Remove(rotationDirPath)
+		result.RotationDir = ""
+	}
+	if err != nil {
+		return result, err
+	}
+
+	logger.FromContext(ctx).InfoContext(ctx, "Rotation batch staged",
+		"directory", result.RotationDir,
+		"items_moved", result.MovedCount,
+		"freed_bytes", config.FormatBytes(result.MovedBytes),
+		"dry_run", opts.DryRun,
+	)
+
+	return result, nil
+}
+
+func stageRotationItems(
+	ctx context.Context,
+	opts RotateOptions,
+	items []FileItem,
+	result *RotateResult,
+) error {
+	log := logger.FromContext(ctx)
 	for _, item := range items {
 		if ctx.Err() != nil {
-			return result, ctx.Err()
+			return ctx.Err()
 		}
 
 		if result.MovedBytes >= opts.BytesToFree {
@@ -83,7 +113,7 @@ func Rotate(ctx context.Context, opts RotateOptions) (RotateResult, error) {
 		}
 
 		if !opts.DryRun {
-			if err := moveSingleItem(item, opts.SourceDir, rotationDirPath); err != nil {
+			if err := moveSingleItem(item, opts.SourceDir, result.RotationDir); err != nil {
 				log.WarnContext(ctx, "Failed to move item, skipping", "path", item.Path, "err", err)
 
 				continue
@@ -95,14 +125,32 @@ func Rotate(ctx context.Context, opts RotateOptions) (RotateResult, error) {
 		result.MovedItems = append(result.MovedItems, item)
 	}
 
-	log.InfoContext(ctx, "Rotation batch staged",
-		"directory", rotationDirPath,
-		"items_moved", result.MovedCount,
-		"freed_bytes", config.FormatBytes(result.MovedBytes),
-		"dry_run", opts.DryRun,
-	)
+	return nil
+}
 
-	return result, nil
+func uniqueRotationDirPath(archiveDir string) string {
+	timestamp := time.Now().UTC().Format("2006-01-02-150405")
+	baseName := fmt.Sprintf("rotation-%s", timestamp)
+	entries, _ := os.ReadDir(archiveDir)
+
+	candidate := baseName
+	for seq := 1; rotationNameExists(candidate, entries); seq++ {
+		candidate = fmt.Sprintf("%s-%d", baseName, seq)
+	}
+
+	return filepath.Join(archiveDir, candidate)
+}
+
+func rotationNameExists(candidate string, entries []os.DirEntry) bool {
+	prefix := candidate + "."
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == candidate || strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func moveSingleItem(item FileItem, sourceRoot, targetDir string) error {
@@ -120,7 +168,7 @@ func moveSingleItem(item FileItem, sourceRoot, targetDir string) error {
 	}
 
 	if renErr := os.Rename(item.Path, destPath); renErr != nil {
-		if copyErr := moveFileFallback(item.Path, destPath); copyErr != nil {
+		if copyErr := moveFileFallback(item.Path, destPath, item.ModTime); copyErr != nil {
 			return fmt.Errorf("moving %s to %s: %w", item.Path, destPath, copyErr)
 		}
 	}
@@ -135,7 +183,7 @@ func moveSingleItem(item FileItem, sourceRoot, targetDir string) error {
 	return nil
 }
 
-func moveFileFallback(src, dst string) (err error) {
+func moveFileFallback(src, dst string, modTime time.Time) error {
 	in, openErr := os.Open(src)
 	if openErr != nil {
 		return fmt.Errorf("opening source file for cross-device copy: %w", openErr)
@@ -146,9 +194,10 @@ func moveFileFallback(src, dst string) (err error) {
 	if createErr != nil {
 		return fmt.Errorf("creating destination file for cross-device copy: %w", createErr)
 	}
+	succeeded := false
 	defer func() {
 		_ = out.Close()
-		if err != nil {
+		if !succeeded {
 			_ = os.Remove(dst)
 		}
 	}()
@@ -163,6 +212,10 @@ func moveFileFallback(src, dst string) (err error) {
 		return fmt.Errorf("closing copied file: %w", closeErr)
 	}
 	_ = in.Close()
+	if !modTime.IsZero() {
+		_ = os.Chtimes(dst, modTime, modTime)
+	}
+	succeeded = true
 
 	return os.Remove(src)
 }
@@ -353,7 +406,7 @@ func CalculateDirSize(dir, ignoreDir string) (int64, int, error) {
 			if path == cleanIgnore || strings.HasPrefix(path, cleanIgnorePrefix) {
 				return filepath.SkipDir
 			}
-		} else {
+		} else if d.Type().IsRegular() {
 			info, statErr := d.Info()
 			if statErr != nil {
 				return statErr
@@ -370,6 +423,10 @@ func CalculateDirSize(dir, ignoreDir string) (int64, int, error) {
 
 // CollectOldestItems walks dir recursively and returns all files sorted oldest to newest by ModTime.
 func CollectOldestItems(dir, ignoreDir string) ([]FileItem, error) {
+	return collectOldestItems(dir, ignoreDir, defaultBatchCapacity)
+}
+
+func collectOldestItems(dir, ignoreDir string, sizeHint int) ([]FileItem, error) {
 	st, err := os.Stat(dir)
 	if err != nil {
 		return nil, fmt.Errorf("stat path %s: %w", dir, err)
@@ -382,9 +439,13 @@ func CollectOldestItems(dir, ignoreDir string) ([]FileItem, error) {
 		}}, nil
 	}
 
+	if sizeHint <= 0 {
+		sizeHint = defaultBatchCapacity
+	}
+
 	cleanIgnore := filepath.Clean(ignoreDir)
 	cleanIgnorePrefix := cleanIgnore + string(filepath.Separator)
-	entries := make([]FileItem, 0, defaultBatchCapacity)
+	entries := make([]FileItem, 0, sizeHint)
 
 	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, wErr error) error {
 		if wErr != nil {
@@ -395,7 +456,7 @@ func CollectOldestItems(dir, ignoreDir string) ([]FileItem, error) {
 			if path == cleanIgnore || strings.HasPrefix(path, cleanIgnorePrefix) {
 				return filepath.SkipDir
 			}
-		} else {
+		} else if d.Type().IsRegular() {
 			info, statErr := d.Info()
 			if statErr != nil {
 				return statErr

@@ -100,7 +100,38 @@ func TestRotate(t *testing.T) {
 		// Target file exists in rotation directory
 		archivedFile := filepath.Join(res.RotationDir, "test.log")
 		_, archStat := os.Stat(archivedFile)
-		assert.NoError(t, archStat)
+		require.NoError(t, archStat)
+
+		// Second rotation in the same second gets a distinct directory
+		f2 := filepath.Join(sourceDir, "test2.log")
+		require.NoError(t, os.WriteFile(f2, []byte("data2"), 0600))
+		res2, err2 := rotator.Rotate(context.Background(), rotator.RotateOptions{
+			SourceDir:   sourceDir,
+			ArchiveDir:  archiveDir,
+			BytesToFree: 5,
+			DryRun:      false,
+		})
+		require.NoError(t, err2)
+		assert.NotEqual(t, res.RotationDir, res2.RotationDir)
+	})
+
+	t.Run("zero bytesToFree does not create empty rotation directory", func(t *testing.T) {
+		t.Parallel()
+		tmp := t.TempDir()
+		sourceDir := filepath.Join(tmp, "source")
+		archiveDir := filepath.Join(tmp, "archive")
+		require.NoError(t, os.MkdirAll(sourceDir, 0755))
+
+		res, err := rotator.Rotate(context.Background(), rotator.RotateOptions{
+			SourceDir:   sourceDir,
+			ArchiveDir:  archiveDir,
+			BytesToFree: 0,
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 0, res.MovedCount)
+		assert.Empty(t, res.RotationDir)
+		_, statErr := os.Stat(archiveDir)
+		assert.True(t, os.IsNotExist(statErr))
 	})
 }
 

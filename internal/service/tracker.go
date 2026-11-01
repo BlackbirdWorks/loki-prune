@@ -37,9 +37,12 @@ type Tracker struct {
 	archivePrefix  string
 	debounceDelay  time.Duration
 	totalSize      int64
+	loopWg         sync.WaitGroup
 	mu             sync.RWMutex
+	startOnce      sync.Once
 	closeOnce      sync.Once
 	closed         bool
+	synced         bool
 }
 
 // NewTracker creates a new Tracker for rootPath, ignoring paths under archiveDir.
@@ -77,7 +80,11 @@ func NewTracker(rootPath, archiveDir string, debounceDelay time.Duration) (*Trac
 
 // Start begins the event processing loop in a background goroutine.
 func (t *Tracker) Start(ctx context.Context) {
-	go t.eventLoop(ctx)
+	t.startOnce.Do(func() {
+		t.loopWg.Go(func() {
+			t.eventLoop(ctx)
+		})
+	})
 }
 
 func (t *Tracker) eventLoop(ctx context.Context) {
@@ -145,8 +152,10 @@ func (t *Tracker) removeFSEventItem(path string) {
 	delete(t.pendingUpdates, path)
 }
 
-// watchRecursively registers a directory and all its subdirectories with the watcher.
+// watchRecursively registers a directory and all its subdirectories with the watcher,
+// and queues any already-created files inside it for debounced size updates.
 func (t *Tracker) watchRecursively(dir string) {
+	foundFiles := false
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -156,10 +165,19 @@ func (t *Tracker) watchRecursively(dir string) {
 				return filepath.SkipDir
 			}
 			_ = t.watcher.Add(path)
+
+			return nil
+		}
+		if !t.isArchive(path) && d.Type().IsRegular() {
+			t.recordPendingUpdate(path)
+			foundFiles = true
 		}
 
 		return nil
 	})
+	if foundFiles {
+		t.triggerDebounce()
+	}
 }
 
 func (t *Tracker) triggerDebounce() {
@@ -195,7 +213,7 @@ func (t *Tracker) onDebounceTimer() {
 
 			continue
 		}
-		if st.IsDir() {
+		if !st.Mode().IsRegular() {
 			continue
 		}
 
@@ -232,7 +250,9 @@ func (t *Tracker) Sync() (int64, int, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			t.items = make(map[string]rotator.FileItem)
+			clear(t.pendingUpdates)
 			t.totalSize = 0
+			t.synced = true
 
 			return 0, 0, nil
 		}
@@ -248,7 +268,9 @@ func (t *Tracker) Sync() (int64, int, error) {
 				ModTime: st.ModTime(),
 			},
 		}
+		clear(t.pendingUpdates)
 		t.totalSize = st.Size()
+		t.synced = true
 
 		return t.totalSize, 1, nil
 	}
@@ -267,6 +289,10 @@ func (t *Tracker) Sync() (int64, int, error) {
 			}
 			_ = t.watcher.Add(path)
 
+			return nil
+		}
+
+		if !d.Type().IsRegular() {
 			return nil
 		}
 
@@ -290,9 +316,19 @@ func (t *Tracker) Sync() (int64, int, error) {
 	}
 
 	t.items = newItems
+	clear(t.pendingUpdates)
 	t.totalSize = newTotal
+	t.synced = true
 
 	return t.totalSize, len(t.items), nil
+}
+
+// Synced reports whether Sync has been successfully executed at least once.
+func (t *Tracker) Synced() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.synced
 }
 
 // Size returns the cached total byte size and file count in O(1) time without disk I/O.
@@ -340,19 +376,23 @@ func (t *Tracker) Events() <-chan struct{} {
 func (t *Tracker) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
-		func() {
-			t.mu.Lock()
-			defer t.mu.Unlock()
-
-			t.closed = true
-			if t.debounceTimer != nil {
-				t.debounceTimer.Stop()
-			}
-			close(t.events)
-		}()
+		t.mu.Lock()
+		t.closed = true
+		if t.debounceTimer != nil {
+			t.debounceTimer.Stop()
+		}
+		t.mu.Unlock()
 
 		close(t.stopCh)
 		err = t.watcher.Close()
+		t.loopWg.Wait()
+
+		t.mu.Lock()
+		if t.debounceTimer != nil {
+			t.debounceTimer.Stop()
+		}
+		close(t.events)
+		t.mu.Unlock()
 	})
 
 	return err

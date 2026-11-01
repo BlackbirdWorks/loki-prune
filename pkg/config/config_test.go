@@ -37,6 +37,7 @@ func TestParseBytes(t *testing.T) {
 		{name: "unknown unit", input: "100XB", expected: 0, err: config.ErrUnknownUnit},
 		{name: "empty input", input: "", expected: 0, err: config.ErrInvalidSizeFormat},
 		{name: "float overflow", input: "1e309GB", expected: 0, err: config.ErrInvalidSizeFormat},
+		{name: "int64 overflow", input: "10000000TB", expected: 0, err: config.ErrInvalidSizeFormat},
 	}
 
 	for _, tc := range tests {
@@ -215,6 +216,10 @@ paths:
 			verify: func(t *testing.T, cfg *config.Config) {
 				t.Helper()
 				assert.Equal(t, 30*time.Second, cfg.Loki.Timeout)
+				assert.True(t, cfg.Loki.FlushBeforeRotate)
+				assert.True(t, cfg.Loki.ReloadAfterRotate)
+				assert.True(t, cfg.Loki.FlushEnabled())
+				assert.True(t, cfg.Loki.ReloadEnabled())
 				assert.Equal(t, 5*time.Minute, cfg.Daemon.Interval)
 				require.Len(t, cfg.Paths, 1)
 
@@ -226,6 +231,36 @@ paths:
 				assert.True(t, cfg.Daemon.Adaptive)
 				assert.Equal(t, 5*time.Second, cfg.Daemon.MinInterval)
 				assert.InDelta(t, 90.0, p.DiskGuardPercent, 0.001)
+			},
+			wantErr: nil,
+		},
+		{
+			name: "explicitly disabled flush and reload with gz alias",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := `
+loki:
+  flush_before_rotate: false
+  reload_after_rotate: false
+paths:
+  - path: "/tmp/chunks"
+    trigger_size: "10GB"
+    rotation:
+      type: "gz"
+`
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: func(t *testing.T, cfg *config.Config) {
+				t.Helper()
+				assert.False(t, cfg.Loki.FlushBeforeRotate)
+				assert.False(t, cfg.Loki.ReloadAfterRotate)
+				assert.False(t, cfg.Loki.FlushEnabled())
+				assert.False(t, cfg.Loki.ReloadEnabled())
+				require.Len(t, cfg.Paths, 1)
+				assert.Equal(t, "gzip", cfg.Paths[0].Rotation.Type)
 			},
 			wantErr: nil,
 		},
@@ -461,6 +496,24 @@ paths:
 				t.Helper()
 				require.Error(t, err)
 				assert.ErrorIs(t, err, config.ErrInvalidDuration)
+			},
+		},
+		{
+			name: "duplicate path name error",
+			setup: func(t *testing.T) string {
+				t.Helper()
+				tmp := filepath.Join(t.TempDir(), "config.yaml")
+				content := "paths:\n  - name: 'dup'\n    path: '/tmp/a'\n    trigger_size: '10GB'\n" +
+					"  - name: 'dup'\n    path: '/tmp/b'\n    trigger_size: '10GB'\n"
+				require.NoError(t, os.WriteFile(tmp, []byte(content), 0600))
+
+				return tmp
+			},
+			verify: nil,
+			wantErr: func(t *testing.T, err error) {
+				t.Helper()
+				require.Error(t, err)
+				assert.ErrorIs(t, err, config.ErrDuplicatePathName)
 			},
 		},
 	}

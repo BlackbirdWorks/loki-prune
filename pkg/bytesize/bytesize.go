@@ -4,6 +4,7 @@ package bytesize
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -89,7 +90,12 @@ parseNumber:
 		return 0, err
 	}
 
-	return int64(val * mult), nil
+	product := val * mult
+	if math.IsNaN(product) || math.IsInf(product, 0) || product >= float64(math.MaxInt64) {
+		return 0, fmt.Errorf("%w: overflow: %q", ErrInvalidFormat, s)
+	}
+
+	return int64(product), nil
 }
 
 func validateUnitString(unitStr string) bool {

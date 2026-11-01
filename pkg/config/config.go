@@ -33,6 +33,8 @@ var (
 	ErrInvalidDuration = errors.New("invalid duration")
 	// ErrInvalidDaemonMode is returned when daemon mode is neither 'poll' nor 'fsevent'.
 	ErrInvalidDaemonMode = errors.New("invalid daemon mode, must be 'poll' or 'fsevent'")
+	// ErrDuplicatePathName is returned when two path entries share the same name.
+	ErrDuplicatePathName = errors.New("duplicate path name")
 )
 
 const (
@@ -58,11 +60,31 @@ type Config struct {
 
 // LokiConfig holds settings for communicating with the Loki API.
 type LokiConfig struct {
-	URL               string        `yaml:"url"`
-	TimeoutStr        string        `yaml:"timeout"`
-	Timeout           time.Duration `yaml:"-"`
-	FlushBeforeRotate bool          `yaml:"flush_before_rotate"`
-	ReloadAfterRotate bool          `yaml:"reload_after_rotate"`
+	FlushBeforeRotateRaw *bool         `yaml:"flush_before_rotate"`
+	ReloadAfterRotateRaw *bool         `yaml:"reload_after_rotate"`
+	URL                  string        `yaml:"url"`
+	TimeoutStr           string        `yaml:"timeout"`
+	Timeout              time.Duration `yaml:"-"`
+	FlushBeforeRotate    bool          `yaml:"-"`
+	ReloadAfterRotate    bool          `yaml:"-"`
+}
+
+// FlushEnabled reports whether Loki should be flushed prior to rotation (defaults to true).
+func (l *LokiConfig) FlushEnabled() bool {
+	if l.FlushBeforeRotateRaw != nil {
+		return *l.FlushBeforeRotateRaw
+	}
+
+	return true
+}
+
+// ReloadEnabled reports whether Loki should be reloaded after rotation (defaults to true).
+func (l *LokiConfig) ReloadEnabled() bool {
+	if l.ReloadAfterRotateRaw != nil {
+		return *l.ReloadAfterRotateRaw
+	}
+
+	return true
 }
 
 // DaemonConfig holds service and scheduling options.
@@ -141,10 +163,16 @@ func (c *Config) validateAndSetDefaults() error {
 		return ErrNoPaths
 	}
 
+	seenNames := make(map[string]struct{}, len(c.Paths))
 	for i := range c.Paths {
 		if err := c.validatePath(i); err != nil {
 			return err
 		}
+		name := c.Paths[i].Name
+		if _, exists := seenNames[name]; exists {
+			return fmt.Errorf("path[%d] (%s): %w", i, name, ErrDuplicatePathName)
+		}
+		seenNames[name] = struct{}{}
 	}
 
 	return nil
@@ -155,6 +183,9 @@ func (c *Config) validateLoki() error {
 		c.Loki.URL = "http://127.0.0.1:3100"
 	}
 	c.Loki.URL = strings.TrimRight(c.Loki.URL, "/")
+
+	c.Loki.FlushBeforeRotate = c.Loki.FlushEnabled()
+	c.Loki.ReloadAfterRotate = c.Loki.ReloadEnabled()
 
 	if c.Loki.TimeoutStr == "" {
 		c.Loki.Timeout = defaultLokiTimeout
@@ -285,14 +316,22 @@ func (c *Config) validatePathSizes(idx int) error {
 	}
 
 	bytes, err := ParseBytes(p.TriggerSizeStr)
-	if err != nil {
+	if err != nil || bytes <= 0 {
+		if err == nil {
+			err = ErrInvalidSizeFormat
+		}
+
 		return fmt.Errorf("path[%d] (%s) invalid trigger_size: %w", idx, p.Name, err)
 	}
 	p.TriggerSizeBytes = bytes
 
 	if p.TargetSizeStr != "" {
 		tBytes, tErr := ParseBytes(p.TargetSizeStr)
-		if tErr != nil {
+		if tErr != nil || tBytes <= 0 {
+			if tErr == nil {
+				tErr = ErrInvalidSizeFormat
+			}
+
 			return fmt.Errorf("path[%d] (%s) invalid target_size: %w", idx, p.Name, tErr)
 		}
 		p.TargetSizeBytes = tBytes
@@ -312,7 +351,10 @@ func (c *Config) validateCompression(idx int) error {
 	if p.Rotation.Type == "" {
 		p.Rotation.Type = "zstd"
 	}
-	p.Rotation.Type = strings.ToLower(p.Rotation.Type)
+	p.Rotation.Type = strings.ToLower(strings.TrimSpace(p.Rotation.Type))
+	if p.Rotation.Type == "gz" {
+		p.Rotation.Type = "gzip"
+	}
 
 	switch p.Rotation.Type {
 	case "zstd", "gzip", "zip", "none":

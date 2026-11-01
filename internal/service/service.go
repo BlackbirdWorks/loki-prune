@@ -87,8 +87,16 @@ func New(cfg *config.Config, opts ...Option) (*Service, error) {
 	}
 
 	for _, p := range cfg.Paths {
+		if _, exists := s.compressors[p.Name]; exists {
+			s.closeAllTrackers()
+
+			return nil, fmt.Errorf("initializing path %s: %w", p.Name, config.ErrDuplicatePathName)
+		}
+
 		comp, err := compressor.New(p.Rotation.Type, p.Rotation.Level)
 		if err != nil {
+			s.closeAllTrackers()
+
 			return nil, fmt.Errorf("initializing compressor for %s: %w", p.Name, err)
 		}
 		s.compressors[p.Name] = comp
@@ -100,6 +108,8 @@ func New(cfg *config.Config, opts ...Option) (*Service, error) {
 			}
 			trk, trkErr := NewTracker(p.Path, p.ArchiveDir, cooldown)
 			if trkErr != nil {
+				s.closeAllTrackers()
+
 				return nil, fmt.Errorf("initializing tracker for %s: %w", p.Name, trkErr)
 			}
 			s.trackers[p.Name] = trk
@@ -107,6 +117,12 @@ func New(cfg *config.Config, opts ...Option) (*Service, error) {
 	}
 
 	return s, nil
+}
+
+func (s *Service) closeAllTrackers() {
+	for _, trk := range s.trackers {
+		_ = trk.Close()
+	}
 }
 
 // Run starts tracking and executes either a single run or the continuous daemon loop.
@@ -142,17 +158,15 @@ func (s *Service) initEventPipeline(ctx context.Context) (<-chan struct{}, func(
 		if trk == nil {
 			continue
 		}
-		trk.Start(ctx)
 		_, _, _ = trk.Sync()
+		trk.Start(ctx)
 
 		forwarderWg.Add(1)
 		go s.forwardEvents(ctx, trk.Events(), combinedEvents, &forwarderWg)
 	}
 
 	cleanup := func() {
-		for _, trk := range s.trackers {
-			_ = trk.Close()
-		}
+		s.closeAllTrackers()
 		forwarderWg.Wait()
 		close(combinedEvents)
 	}
@@ -243,13 +257,13 @@ func (s *Service) processPath(ctx context.Context, p config.PathConfig) (float64
 			"trigger", config.FormatBytes(p.TriggerSizeBytes),
 		)
 
-		if rotErr := s.rotatePath(ctx, p, currentSize); rotErr != nil {
+		if rotErr := s.rotatePath(ctx, p, currentSize, fileCount); rotErr != nil {
 			return ratio, fmt.Errorf("executing rotation on %s: %w", p.Name, rotErr)
 		}
 		rotated = true
 	}
 
-	ratio, guardErr := s.checkDiskGuard(ctx, p, currentSize, rotated, ratio)
+	ratio, guardErr := s.checkDiskGuard(ctx, p, currentSize, fileCount, rotated, ratio)
 	if guardErr != nil {
 		return ratio, guardErr
 	}
@@ -281,8 +295,7 @@ func (s *Service) getPathSize(p config.PathConfig) (int64, int, error) {
 		return sz, count, nil
 	}
 
-	currentSize, fileCount := trk.Size()
-	if currentSize == 0 && fileCount == 0 {
+	if !trk.Synced() {
 		sz, count, err := trk.Sync()
 		if err != nil {
 			return 0, 0, fmt.Errorf("syncing tracker for %s: %w", p.Name, err)
@@ -291,6 +304,8 @@ func (s *Service) getPathSize(p config.PathConfig) (int64, int, error) {
 		return sz, count, nil
 	}
 
+	currentSize, fileCount := trk.Size()
+
 	return currentSize, fileCount, nil
 }
 
@@ -298,6 +313,7 @@ func (s *Service) checkDiskGuard(
 	ctx context.Context,
 	p config.PathConfig,
 	currentSize int64,
+	fileCount int,
 	rotated bool,
 	currentRatio float64,
 ) (float64, error) {
@@ -314,14 +330,14 @@ func (s *Service) checkDiskGuard(
 	diskRatio := usage.UsedPercent / percentFactor
 	ratio := math.Max(currentRatio, diskRatio)
 
-	if usage.UsedPercent >= guardThreshold && !rotated {
+	if usage.UsedPercent >= guardThreshold && !rotated && currentSize > 0 {
 		log := logger.FromContext(ctx)
 		log.WarnContext(ctx, "Disk guard threshold exceeded, triggering emergency rotation",
 			"name", p.Name,
 			"used_percent", fmt.Sprintf("%.2f%%", usage.UsedPercent),
 			"guard_threshold", fmt.Sprintf("%.2f%%", guardThreshold),
 		)
-		if rotErr := s.rotatePath(ctx, p, currentSize); rotErr != nil {
+		if rotErr := s.rotatePath(ctx, p, currentSize, fileCount); rotErr != nil {
 			return ratio, fmt.Errorf("executing emergency disk guard rotation on %s: %w", p.Name, rotErr)
 		}
 	}
@@ -329,15 +345,17 @@ func (s *Service) checkDiskGuard(
 	return ratio, nil
 }
 
-func (s *Service) rotatePath(ctx context.Context, p config.PathConfig, currentSize int64) error {
+func (s *Service) rotatePath(ctx context.Context, p config.PathConfig, currentSize int64, fileCount int) error {
 	log := logger.FromContext(ctx)
 
-	log.InfoContext(ctx, "Flushing Loki before rotating")
-	if !s.dryRun {
-		if err := s.lokiClient.Flush(ctx); err != nil {
-			log.WarnContext(ctx, "Loki flush failed (proceeding with caution)", "err", err)
-		} else {
-			log.InfoContext(ctx, "Loki flush completed successfully")
+	if s.cfg.Loki.FlushEnabled() {
+		log.InfoContext(ctx, "Flushing Loki before rotating")
+		if !s.dryRun {
+			if err := s.lokiClient.Flush(ctx); err != nil {
+				log.WarnContext(ctx, "Loki flush failed (proceeding with caution)", "err", err)
+			} else {
+				log.InfoContext(ctx, "Loki flush completed successfully")
+			}
 		}
 	}
 
@@ -348,11 +366,17 @@ func (s *Service) rotatePath(ctx context.Context, p config.PathConfig, currentSi
 	}
 
 	bytesToFree := currentSize - p.TargetSizeBytes
+	if bytesToFree <= 0 {
+		const emergencyFreeDivisor = 5
+		bytesToFree = max(1, currentSize/emergencyFreeDivisor)
+	}
+
 	res, rotErr := rotator.Rotate(ctx, rotator.RotateOptions{
 		SourceDir:   p.Path,
 		ArchiveDir:  p.ArchiveDir,
 		Items:       items,
 		BytesToFree: bytesToFree,
+		SizeHint:    fileCount,
 		DryRun:      s.dryRun,
 	})
 	if rotErr != nil {
@@ -365,10 +389,12 @@ func (s *Service) rotatePath(ctx context.Context, p config.PathConfig, currentSi
 		}
 	}
 
-	log.InfoContext(ctx, "Synchronizing Loki after rotation")
-	if !s.dryRun {
-		if err := s.lokiClient.Reload(ctx); err != nil {
-			log.WarnContext(ctx, "Loki reload after rotation returned error", "err", err)
+	if s.cfg.Loki.ReloadEnabled() {
+		log.InfoContext(ctx, "Synchronizing Loki after rotation")
+		if !s.dryRun {
+			if err := s.lokiClient.Reload(ctx); err != nil {
+				log.WarnContext(ctx, "Loki reload after rotation returned error", "err", err)
+			}
 		}
 	}
 
@@ -394,6 +420,7 @@ func (s *Service) runDaemonAdaptive(ctx context.Context, initialRatio float64, e
 	)
 
 	triggerCycle := func() {
+		timer.Stop()
 		ratio := s.RunCycle(ctx)
 		currentInterval = ComputeNextInterval(interval, minInterval, adaptive, ratio)
 		timer.Reset(currentInterval)

@@ -119,6 +119,7 @@ func TestCompressor_CompressDirectory(t *testing.T) {
 				src := filepath.Join(tmp, "src")
 				require.NoError(t, os.MkdirAll(filepath.Join(src, "sub"), 0750))
 				require.NoError(t, os.WriteFile(filepath.Join(src, "file1.txt"), []byte("hello"), 0600))
+				_ = os.Symlink(filepath.Join(src, "file1.txt"), filepath.Join(src, "link.txt"))
 				c, err := compressor.New("zstd", 0)
 				require.NoError(t, err)
 
@@ -378,6 +379,13 @@ func TestCompressor_CompressDirectory(t *testing.T) {
 				info, statErr := os.Stat(dst)
 				require.NoError(t, statErr)
 				assert.Positive(t, info.Size())
+
+				// Exercise pooled writer reuse on second archive
+				dst2 := dst + ".second"
+				require.NoError(t, c.CompressDirectory(src, dst2))
+				info2, statErr2 := os.Stat(dst2)
+				require.NoError(t, statErr2)
+				assert.Positive(t, info2.Size())
 			}
 		})
 	}

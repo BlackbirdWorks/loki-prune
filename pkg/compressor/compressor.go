@@ -45,9 +45,10 @@ const (
 
 // Compressor compresses files and directories into tar archives.
 type Compressor struct {
-	bufPool  *sync.Pool
-	compType CompressionType
-	level    int
+	bufPool    *sync.Pool
+	writerPool *sync.Pool
+	compType   CompressionType
+	level      int
 }
 
 // New creates a new Compressor.
@@ -70,8 +71,9 @@ func New(cType string, level int) (*Compressor, error) {
 // NewWithType creates a Compressor with an explicit CompressionType.
 func NewWithType(compType CompressionType, level int) *Compressor {
 	return &Compressor{
-		compType: compType,
-		level:    level,
+		compType:   compType,
+		level:      level,
+		writerPool: &sync.Pool{},
 		bufPool: &sync.Pool{
 			New: func() any {
 				buf := make([]byte, copyBufSize)
@@ -104,6 +106,33 @@ func (c *Compressor) CompressDirectory(sourceDir, targetArchive string) error {
 		return c.compressZip(sourceDir, targetArchive)
 	}
 
+	return writeAtomicArchive(targetArchive, func(outFile io.Writer) error {
+		compWriter, compErr := c.createCompWriter(outFile)
+		if compErr != nil {
+			return compErr
+		}
+
+		tarWriter := tar.NewWriter(compWriter)
+		if walkErr := c.archiveWalk(sourceDir, tarWriter); walkErr != nil {
+			_ = compWriter.Close()
+
+			return walkErr
+		}
+
+		if tarCloseErr := tarWriter.Close(); tarCloseErr != nil {
+			_ = compWriter.Close()
+
+			return fmt.Errorf("closing tar writer: %w", tarCloseErr)
+		}
+		if compCloseErr := compWriter.Close(); compCloseErr != nil {
+			return fmt.Errorf("closing compression writer: %w", compCloseErr)
+		}
+
+		return nil
+	})
+}
+
+func writeAtomicArchive(targetArchive string, writeFn func(io.Writer) error) error {
 	if err := os.MkdirAll(filepath.Dir(targetArchive), dirPerm); err != nil {
 		return fmt.Errorf("creating target parent directory: %w", err)
 	}
@@ -118,22 +147,10 @@ func (c *Compressor) CompressDirectory(sourceDir, targetArchive string) error {
 		_ = os.Remove(tempArchive)
 	}()
 
-	compWriter, compErr := c.createCompWriter(outFile)
-	if compErr != nil {
-		return compErr
+	if err := writeFn(outFile); err != nil {
+		return err
 	}
 
-	tarWriter := tar.NewWriter(compWriter)
-	if walkErr := c.archiveWalk(sourceDir, tarWriter); walkErr != nil {
-		return walkErr
-	}
-
-	if tarCloseErr := tarWriter.Close(); tarCloseErr != nil {
-		return fmt.Errorf("closing tar writer: %w", tarCloseErr)
-	}
-	if compCloseErr := compWriter.Close(); compCloseErr != nil {
-		return fmt.Errorf("closing compression writer: %w", compCloseErr)
-	}
 	if syncErr := outFile.Sync(); syncErr != nil {
 		return fmt.Errorf("syncing archive file: %w", syncErr)
 	}
@@ -148,58 +165,97 @@ func (c *Compressor) CompressDirectory(sourceDir, targetArchive string) error {
 	return nil
 }
 
+type pooledWriteCloser struct {
+	w     io.WriteCloser
+	pool  *sync.Pool
+	reset func(io.Writer)
+}
+
+func (p *pooledWriteCloser) Write(b []byte) (int, error) {
+	return p.w.Write(b)
+}
+
+func (p *pooledWriteCloser) Close() error {
+	err := p.w.Close()
+	p.reset(io.Discard)
+	p.pool.Put(p.w)
+
+	return err
+}
+
 func (c *Compressor) createCompWriter(w io.Writer) (io.WriteCloser, error) {
 	switch c.compType {
 	case TypeZstd:
-		zLevel := zstd.SpeedDefault
-		if c.level > 0 {
-			switch {
-			case c.level <= zstdLevelFastest:
-				zLevel = zstd.SpeedFastest
-			case c.level <= zstdLevelDefault:
-				zLevel = zstd.SpeedDefault
-			case c.level <= zstdLevelBetter:
-				zLevel = zstd.SpeedBetterCompression
-			default:
-				zLevel = zstd.SpeedBestCompression
-			}
-		}
-
-		zEnc, zErr := zstd.NewWriter(
-			w,
-			zstd.WithEncoderLevel(zLevel),
-			zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
-		)
-		if zErr != nil {
-			return nil, fmt.Errorf("initializing zstd writer: %w", zErr)
-		}
-
-		return zEnc, nil
-
+		return c.acquireZstdWriter(w)
 	case TypeGzip:
-		gzLevel := gzip.DefaultCompression
-		if c.level >= 1 && c.level <= 9 {
-			gzLevel = c.level
-		}
-		gzWriter, gzErr := gzip.NewWriterLevel(w, gzLevel)
-		if gzErr != nil {
-			return nil, fmt.Errorf("initializing gzip writer: %w", gzErr)
-		}
-
-		return gzWriter, nil
-
+		return c.acquireGzipWriter(w)
 	case TypeNone:
 		return NopWriteCloser(w), nil
-
 	default:
 		return nil, ErrUnsupportedCompression
 	}
+}
+
+func (c *Compressor) acquireZstdWriter(w io.Writer) (io.WriteCloser, error) {
+	if pooled, ok := c.writerPool.Get().(*zstd.Encoder); ok {
+		pooled.Reset(w)
+
+		return &pooledWriteCloser{w: pooled, pool: c.writerPool, reset: pooled.Reset}, nil
+	}
+
+	zLevel := zstd.SpeedDefault
+	if c.level > 0 {
+		switch {
+		case c.level <= zstdLevelFastest:
+			zLevel = zstd.SpeedFastest
+		case c.level <= zstdLevelDefault:
+			zLevel = zstd.SpeedDefault
+		case c.level <= zstdLevelBetter:
+			zLevel = zstd.SpeedBetterCompression
+		default:
+			zLevel = zstd.SpeedBestCompression
+		}
+	}
+
+	zEnc, zErr := zstd.NewWriter(
+		w,
+		zstd.WithEncoderLevel(zLevel),
+		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)),
+	)
+	if zErr != nil {
+		return nil, fmt.Errorf("initializing zstd writer: %w", zErr)
+	}
+
+	return &pooledWriteCloser{w: zEnc, pool: c.writerPool, reset: zEnc.Reset}, nil
+}
+
+func (c *Compressor) acquireGzipWriter(w io.Writer) (io.WriteCloser, error) {
+	if pooled, ok := c.writerPool.Get().(*gzip.Writer); ok {
+		pooled.Reset(w)
+
+		return &pooledWriteCloser{w: pooled, pool: c.writerPool, reset: pooled.Reset}, nil
+	}
+
+	gzLevel := gzip.DefaultCompression
+	if c.level >= 1 && c.level <= 9 {
+		gzLevel = c.level
+	}
+	gzWriter, gzErr := gzip.NewWriterLevel(w, gzLevel)
+	if gzErr != nil {
+		return nil, fmt.Errorf("initializing gzip writer: %w", gzErr)
+	}
+
+	return &pooledWriteCloser{w: gzWriter, pool: c.writerPool, reset: gzWriter.Reset}, nil
 }
 
 func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
 	return filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
+		}
+
+		if !d.IsDir() && !d.Type().IsRegular() {
+			return nil
 		}
 
 		relPath, relErr := filepath.Rel(sourceDir, path)
@@ -235,61 +291,43 @@ func (c *Compressor) archiveWalk(sourceDir string, tw *tar.Writer) error {
 }
 
 func (c *Compressor) compressZip(sourceDir, targetArchive string) error {
-	if err := os.MkdirAll(filepath.Dir(targetArchive), dirPerm); err != nil {
-		return fmt.Errorf("creating target parent directory: %w", err)
-	}
+	return writeAtomicArchive(targetArchive, func(outFile io.Writer) error {
+		zw := zip.NewWriter(outFile)
+		if c.level > 0 {
+			zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+				lvl := flate.DefaultCompression
+				if c.level >= 1 && c.level <= 9 {
+					lvl = c.level
+				}
 
-	tempArchive := targetArchive + ".tmp"
-	outFile, openErr := os.OpenFile(tempArchive, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, filePerm)
-	if openErr != nil {
-		return fmt.Errorf("creating temporary archive file: %w", openErr)
-	}
-	defer func() {
-		_ = outFile.Close()
-		_ = os.Remove(tempArchive)
-	}()
+				return flate.NewWriter(out, lvl)
+			})
+		}
 
-	zw := zip.NewWriter(outFile)
-	if c.level > 0 {
-		zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
-			lvl := flate.DefaultCompression
-			if c.level >= 1 && c.level <= 9 {
-				lvl = c.level
+		walkErr := filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
 
-			return flate.NewWriter(out, lvl)
+			return c.zipWalkEntry(zw, sourceDir, path, d)
 		})
-	}
-
-	walkErr := filepath.WalkDir(sourceDir, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
 
-		return c.zipWalkEntry(zw, sourceDir, path, d)
+		if closeErr := zw.Close(); closeErr != nil {
+			return fmt.Errorf("closing zip writer: %w", closeErr)
+		}
+
+		return nil
 	})
-	if walkErr != nil {
-		return walkErr
-	}
-
-	if closeErr := zw.Close(); closeErr != nil {
-		return fmt.Errorf("closing zip writer: %w", closeErr)
-	}
-	if syncErr := outFile.Sync(); syncErr != nil {
-		return fmt.Errorf("syncing archive file: %w", syncErr)
-	}
-	if closeErr := outFile.Close(); closeErr != nil {
-		return fmt.Errorf("closing file: %w", closeErr)
-	}
-
-	if renameErr := os.Rename(tempArchive, targetArchive); renameErr != nil {
-		return fmt.Errorf("moving temporary archive to final location: %w", renameErr)
-	}
-
-	return nil
 }
 
 func (c *Compressor) zipWalkEntry(zw *zip.Writer, sourceDir, path string, d fs.DirEntry) error {
+	if !d.IsDir() && !d.Type().IsRegular() {
+		return nil
+	}
+
 	relPath, relErr := filepath.Rel(sourceDir, path)
 	if relErr != nil {
 		return fmt.Errorf("rel path calculation: %w", relErr)
