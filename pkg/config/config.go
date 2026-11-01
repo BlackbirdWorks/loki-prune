@@ -216,15 +216,24 @@ func (c *Config) validateDaemon() error {
 	return nil
 }
 
+// SetMode validates and sets the daemon mode ("poll" or "fsevent").
+func (c *Config) SetMode(mode string) error {
+	norm := strings.ToLower(strings.TrimSpace(mode))
+	if norm == "" {
+		norm = ModePoll
+	}
+	if norm != ModePoll && norm != ModeFSEvent {
+		return fmt.Errorf("%w: %q", ErrInvalidDaemonMode, mode)
+	}
+	c.Daemon.Mode = norm
+
+	return nil
+}
+
 func (c *Config) validateDaemonMode() error {
-	mode := strings.ToLower(strings.TrimSpace(c.Daemon.Mode))
-	if mode == "" {
-		mode = ModePoll
+	if err := c.SetMode(c.Daemon.Mode); err != nil {
+		return err
 	}
-	if mode != ModePoll && mode != ModeFSEvent {
-		return fmt.Errorf("%w: %q", ErrInvalidDaemonMode, c.Daemon.Mode)
-	}
-	c.Daemon.Mode = mode
 
 	if c.Daemon.CooldownStr == "" {
 		c.Daemon.Cooldown = defaultCooldown

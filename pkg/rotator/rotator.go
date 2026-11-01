@@ -366,7 +366,7 @@ func collectAllRotations(archiveDir string, entries []os.DirEntry) []rotationIte
 	var items []rotationItem
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "rotation-") {
+		if !strings.HasPrefix(name, "rotation-") || strings.HasSuffix(name, ".tmp") {
 			continue
 		}
 		info, err := entry.Info()

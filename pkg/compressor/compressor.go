@@ -176,9 +176,15 @@ func (p *pooledWriteCloser) Write(b []byte) (int, error) {
 }
 
 func (p *pooledWriteCloser) Close() error {
-	err := p.w.Close()
-	p.reset(io.Discard)
-	p.pool.Put(p.w)
+	if p.w == nil {
+		return nil
+	}
+
+	w := p.w
+	p.w = nil
+	err := w.Close()
+	p.reset(nil)
+	p.pool.Put(w)
 
 	return err
 }

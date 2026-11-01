@@ -101,7 +101,7 @@ func New(cfg *config.Config, opts ...Option) (*Service, error) {
 		}
 		s.compressors[p.Name] = comp
 
-		if cfg.Daemon.Mode == config.ModeFSEvent {
+		if cfg.Daemon.Mode == config.ModeFSEvent && !s.once {
 			cooldown := cfg.Daemon.Cooldown
 			if s.debounceDelay > 0 {
 				cooldown = s.debounceDelay
@@ -132,7 +132,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer cancel()
 
 	var events <-chan struct{}
-	if s.cfg.Daemon.Mode == config.ModeFSEvent {
+	if s.cfg.Daemon.Mode == config.ModeFSEvent && !s.once {
 		combinedEvents, cleanup := s.initEventPipeline(runCtx)
 		defer cleanup()
 		events = combinedEvents

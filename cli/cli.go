@@ -88,7 +88,9 @@ func (c *CLI) execute(ctx context.Context, out io.Writer) error {
 	}
 
 	if c.Mode != "" {
-		cfg.Daemon.Mode = c.Mode
+		if modeErr := cfg.SetMode(c.Mode); modeErr != nil {
+			return fmt.Errorf("validating mode flag: %w", modeErr)
+		}
 	}
 
 	appLog := logger.New(out, cfg.Daemon.LogType, logger.ParseLevel(cfg.Daemon.LogLevel))
